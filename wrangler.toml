@@ -1,0 +1,7 @@
+name = "chop-mvp"
+main = "src/worker.js"
+compatibility_date = "2025-07-01"
+workers_dev = true
+
+[vars]
+SITE_NAME = "Chop"
