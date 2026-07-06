@@ -6,7 +6,7 @@
 const B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 function t(n) { let s='';for(let i=n||8;i>0;i--)s+=B62[Math.random()*62|0];return s; }
 
-// Static questions for MVP -- AI generation deferred
+// Static fallback questions -- used when AI generation fails
 const DEFAULT_QUESTIONS = [
   {qid:'Q-SCOPE-01',category:'scope',text:'What specific systems, tools, or processes does this topic cover?'},
   {qid:'Q-SCOPE-02',category:'scope',text:'What is explicitly OUT of scope for this knowledge base?'},
@@ -19,6 +19,119 @@ const DEFAULT_QUESTIONS = [
   {qid:'Q-SOURCE-01',category:'source',text:'Where does the authoritative truth live? (docs, dashboards, people)'},
   {qid:'Q-PERSONA-02',category:'persona',text:'If someone new joined tomorrow, what would they be confused about?'},
 ];
+
+// AI-powered question generation -- adaptive, seed-decomposing
+// Calls OpenRouter to analyze the seed and produce specific questions
+async function generateQuestions(seed, env) {
+  var apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    console.error('generateQuestions: No OPENROUTER_API_KEY configured, falling back to defaults');
+    return DEFAULT_QUESTIONS;
+  }
+
+  var systemPrompt = `You are a knowledge-capture question designer. Your job is to analyze a seed topic and generate a targeted questionnaire.
+
+## Your process (internal — do not output this analysis)
+1. **Decompose the seed**: Extract the domain/topic, identify what kind of knowledge is being sought (process, tooling, people, strategy, architecture, etc.), identify implied personas/stakeholders, and detect any explicit constraints or scope boundaries.
+2. **Generate 8-12 questions** across these 7 categories, but make them SPECIFIC to the seed — not generic templates:
+   - SCOPE: What's in/out, boundaries, covered areas
+   - PERSONA: Who needs this, what do they need to know
+   - PROCESS: Core flow, steps, tools, permissions
+   - PEOPLE: Who knows, who owns, who to ask
+   - GAP: What's missing, undocumented, unclear
+   - FAILURE: What goes wrong, common mistakes
+   - SOURCE: Where's the authoritative truth
+
+## Rules
+- Each question must be clearly tailored to the seed topic. If the seed is about "deploying a React app to Cloudflare Pages", do NOT ask "What tools are used?" — ask "What specific Cloudflare Pages settings (build command, output directory, environment variables) are needed for this React app?"
+- Use concrete nouns and specifics from the seed in every question.
+- Return 8-12 questions.
+- Output ONLY a valid JSON array. No markdown fences, no commentary.
+- Each object: {"qid": "Q-CATEGORY-NN", "category": "scope|persona|process|people|gap|failure|source", "text": "the question text"}
+
+## Examples of good vs bad questions
+
+Seed: "We need to document how our CI/CD pipeline works for deploying the frontend monorepo"
+BAD (generic): "What tools are used in the process?"
+GOOD (specific): "What specific CI/CD platform (GitHub Actions, CircleCI, etc.) runs the frontend monorepo pipeline, and what are the key workflow steps from PR merge to production deploy?"
+
+BAD (generic): "Who are the key people involved?"
+GOOD (specific): "Who owns the CI/CD configuration for the frontend monorepo, and who needs to approve changes to the deploy pipeline?"
+
+Seed: "Document the onboarding process for new data engineers joining the analytics team"
+BAD (generic): "What is the core process?"
+GOOD (specific): "What are the step-by-step tasks a new data engineer must complete in their first week — from getting AWS IAM access to running their first dbt model in production?"
+
+BAD (generic): "What tools are needed?"
+GOOD (specific): "Which specific tools and platforms (dbt, Snowflake, Airflow, Looker, GitHub) does a new data engineer need accounts for, and who grants each access?"`;
+
+  var userPrompt = `Seed topic: "${seed}"
+
+Analyze this seed and generate 8-12 specific, targeted questions for a knowledge capture questionnaire. Make every question clearly tailored to this specific topic — use concrete nouns, specific tools, named roles, and real details from the seed. Do NOT use generic question templates.`;
+
+  try {
+    var response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey,
+        'HTTP-Referer': 'https://chop-mvp.nousresearch.com',
+        'X-Title': 'Chop MVP'
+      },
+      body: JSON.stringify({
+        model: 'openai/gpt-4o-mini',
+        messages: [
+          {role: 'system', content: systemPrompt},
+          {role: 'user', content: userPrompt}
+        ],
+        temperature: 0.7,
+        max_tokens: 2000
+      })
+    });
+
+    if (!response.ok) {
+      console.error('generateQuestions: API returned ' + response.status, await response.text());
+      return DEFAULT_QUESTIONS;
+    }
+
+    var data = await response.json();
+    var content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (!content) {
+      console.error('generateQuestions: No content in response', JSON.stringify(data));
+      return DEFAULT_QUESTIONS;
+    }
+
+    // Strip any markdown code fences the model might add
+    content = content.trim();
+    if (content.startsWith('```json')) content = content.slice(7);
+    else if (content.startsWith('```')) content = content.slice(3);
+    if (content.endsWith('```')) content = content.slice(0, -3);
+    content = content.trim();
+
+    var questions = JSON.parse(content);
+
+    // Validate structure
+    if (!Array.isArray(questions) || questions.length < 8 || questions.length > 12) {
+      console.error('generateQuestions: Invalid question count or not an array', questions.length);
+      return DEFAULT_QUESTIONS;
+    }
+
+    for (var i = 0; i < questions.length; i++) {
+      var q = questions[i];
+      if (!q.qid || !q.category || !q.text ||
+          ['scope','persona','process','people','gap','failure','source'].indexOf(q.category) === -1) {
+        console.error('generateQuestions: Invalid question at index ' + i, JSON.stringify(q));
+        return DEFAULT_QUESTIONS;
+      }
+    }
+
+    return questions;
+
+  } catch (e) {
+    console.error('generateQuestions: Exception', e.message);
+    return DEFAULT_QUESTIONS;
+  }
+}
 
 // HTML shell -- string concatenation, no template literals
 const CSS = '*{box-sizing:border-box;margin:0;padding:0}'+
@@ -108,12 +221,32 @@ async function homePage(req, env) {
     'var tot=d.experts.length;var done=d.experts.filter(function(e){return e.status==="completed"}).length;'+
     'pa.style.display="block";pa.innerHTML=\'<div style="margin-top:8px;padding-top:12px;border-top:1px solid #333"><div class="progress"><span>People: \'+tot+\'</span><span>Done: \'+done+\'</span></div></div>\';'+
     'var hasAns=d.experts.some(function(e){return parseInt(e.answered||0)>0});sb.style.display=hasAns?"inline-flex":"none"}'+
-    'async function triggerSynth(){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");var b=document.getElementById("synthesize-btn");b.disabled=true;b.textContent="Synthesizing...";'+
-    'try{var r=await fetch("/api/projects/"+pid+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok}});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");'+
-    'var o=document.getElementById("synthesis-output");o.style.display="block";o.innerHTML=\'<div class="card"><h3>Output</h3><pre id="md-out">\'+escHtml(d.markdown)+\'</pre><div style="margin-top:12px"><button class="btn btn-sm" onclick="copyMd()">Copy</button></div></div>\';showToast("Synthesis complete!")}catch(e){showToast("Error: "+e.message)}'+
-    'b.disabled=false;b.textContent="Synthesize Now"}'+
-    'function copyMd(){var p=document.getElementById("md-out");navigator.clipboard.writeText(p.textContent).then(function(){showToast("Copied!")})}'+
-    'function escHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}'
+        'async function triggerSynth(){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");var b=document.getElementById("synthesize-btn");b.disabled=true;b.textContent="Synthesizing...";'+
+        'try{var r=await fetch("/api/projects/"+pid+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok}});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");'+
+        'var o=document.getElementById("synthesis-output");o.style.display="block";'+
+        'var bundleHtml="";if(d.bundle){var bkeys=Object.keys(d.bundle);'+
+        'bundleHtml=\'<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">\';'+
+        'bundleHtml+=\'<button class="btn btn-sm" onclick="downloadBundle()">Download OKF Bundle (.zip)</button>\';'+
+        'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'index.md\')">index.md</button>\';'+
+        'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'log.md\')">log.md</button>\';'+
+        'bkeys.forEach(function(f){if(f!==\'index.md\'&&f!==\'log.md\'){bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'\'+f+\'\')">\'+f+\'</button>\'}});'+
+        'bundleHtml+=\'</div>\';}'+
+        'o.innerHTML=\'<div class="card"><h3>Output</h3><pre id="md-out">\'+escHtml(d.markdown)+\'</pre><div style="margin-top:12px"><button class="btn btn-sm" onclick="copyMd()">Copy Markdown</button></div>\'+bundleHtml+\'</div>\';showToast("Synthesis complete!")}catch(e){showToast("Error: "+e.message)}'+
+        'b.disabled=false;b.textContent="Synthesize Now"}'+
+        'function copyMd(){var p=document.getElementById("md-out");navigator.clipboard.writeText(p.textContent).then(function(){showToast("Copied!")})}'+
+        'function downloadBundle(){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");'+
+        'fetch("/api/projects/"+pid+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok}}).then(function(r){return r.json()}).then(function(d){'+
+        'if(!d.bundle){showToast("No bundle data");return}'+
+        'var zip=new JSZip();var bkeys=Object.keys(d.bundle);'+
+        'for(var i=0;i<bkeys.length;i++){zip.file(bkeys[i],d.bundle[bkeys[i]])}'+
+        'zip.generateAsync({type:"blob"}).then(function(blob){'+
+        'var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="okf-bundle-"+pid+".zip";a.click();'+
+        'URL.revokeObjectURL(a.href);showToast("Bundle downloaded!")})})}'+
+        'function downloadFile(fn){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");'+
+        'fetch("/api/projects/"+pid+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok}}).then(function(r){return r.json()}).then(function(d){'+
+        'if(!d.bundle||!d.bundle[fn]){showToast("File not found");return}'+
+        'var blob=new Blob([d.bundle[fn]],{type:"text/markdown"});var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=fn;a.click();URL.revokeObjectURL(a.href)})}'+
+        'function escHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}'
   ), {headers:{'Content-Type':'text/html'}});
 }
 
@@ -221,12 +354,16 @@ async function createProject(req, env) {
   var body = await req.json();
   if (!body.seed || body.seed.length < 5) return json({error:'Seed too short'}, 400);
   var id = t(12), ot = t(8), name = body.seed.split('.')[0].slice(0,40).trim() || 'Untitled';
-  var project = {id, owner_token:ot, name, seed:body.seed, questions:DEFAULT_QUESTIONS, status:'questions_generated', created_at:new Date().toISOString()};
+
+  // Generate questions via AI, with fallback to static defaults
+  var questions = await generateQuestions(body.seed, env);
+
+  var project = {id, owner_token:ot, name, seed:body.seed, questions, status:'questions_generated', created_at:new Date().toISOString()};
   await store.put('project:'+id, JSON.stringify(project));
   await store.put('owner:'+ot+':project', id);
   var list = JSON.parse(await store.get('projects_list') || '[]');
   list.push(id); await store.put('projects_list', JSON.stringify(list));
-  logEvent(env, 'project_created', {id, name, qs:DEFAULT_QUESTIONS.length});
+  logEvent(env, 'project_created', {id, name, qs:questions.length, ai_generated:questions !== DEFAULT_QUESTIONS});
   return json({...project});
 }
 
@@ -324,6 +461,7 @@ async function synthesize(req, env, pid) {
   var p = JSON.parse(pStr);
   if (p.owner_token !== ot) return json({error:'Unauthorized'}, 403);
   var experts = JSON.parse(await store.get('project_experts:'+pid) || '[]');
+  var respondents = experts.filter(function(e){return e.answered > 0});
   var all = [];
   for (var i = 0; i < experts.length; i++) {
     var ak = 'assignments:'+pid+':'+experts[i].token;
@@ -341,13 +479,22 @@ async function synthesize(req, env, pid) {
     if (!byQ[all[k].qid]) byQ[all[k].qid] = {qid:all[k].qid, q:all[k].q, answers:[]};
     byQ[all[k].qid].answers.push({name:all[k].name, a:all[k].a});
   }
+  var qidToCategory = {};
+  var questions = p.questions || [];
+  for (var qi = 0; qi < questions.length; qi++) {
+    qidToCategory[questions[qi].qid] = questions[qi].category;
+  }
   var groups = Object.values(byQ);
-  var now = new Date().toISOString().slice(0,10);
+  var now = new Date();
+  var dateStr = now.toISOString().slice(0,10);
+  var timestamp = now.toISOString();
+
+  // ---- Build backward-compatible flat markdown ----
   var md = '# ' + p.name + ' - Context Summary\n';
-  md += '#version v1\n#generated ' + now + '\n\n';
+  md += '#version v1\n#generated ' + dateStr + '\n\n';
   md += '## Metadata\n';
   md += '- Seed: ' + p.seed + '\n';
-  md += '- Respondents: ' + experts.filter(function(e){return e.answered > 0}).map(function(e){return e.name}).join(', ') + '\n';
+  md += '- Respondents: ' + respondents.map(function(e){return e.name}).join(', ') + '\n';
   md += '- Questions Answered: ' + all.length + '\n';
   md += '- Status: MVP raw answers\n\n';
   md += '## Raw Answers by Question\n\n';
@@ -360,10 +507,181 @@ async function synthesize(req, env, pid) {
     md += '  </question>\n</respondent>\n\n';
   }
   md += '--- End of Document ---\n';
+
+  // ---- Build OKF Bundle ----
+  // Group answers by category
+  var byCategory = {};
+  for (var ci = 0; ci < groups.length; ci++) {
+    var g = groups[ci];
+    var cat = qidToCategory[g.qid] || 'uncategorized';
+    if (!byCategory[cat]) byCategory[cat] = [];
+    byCategory[cat].push(g);
+  }
+
+  // Category display names and descriptions
+  var categoryMeta = {
+    scope:     {title: 'Scope',     description: 'Boundaries, systems, tools, and coverage areas.'},
+    persona:   {title: 'Persona',   description: 'Who needs this knowledge and what they need.'},
+    process:   {title: 'Process',   description: 'Core workflow steps, tools, and permissions.'},
+    people:    {title: 'People',    description: 'Key people, roles, and ownership.'},
+    gap:       {title: 'Gap',       description: 'What is undocumented or poorly understood.'},
+    failure:   {title: 'Failure',   description: 'Common mistakes and failure points.'},
+    source:    {title: 'Source',    description: 'Authoritative sources of truth.'}
+  };
+
+  // Determine confidence levels
+  function confidenceLevel(catAnswers) {
+    var total = 0, expertsWithAnswer = {};
+    for (var i = 0; i < catAnswers.length; i++) {
+      for (var j = 0; j < catAnswers[i].answers.length; j++) {
+        expertsWithAnswer[catAnswers[i].answers[j].name] = true;
+        total++;
+      }
+    }
+    var numExperts = Object.keys(expertsWithAnswer).length;
+    if (numExperts >= 3 && total >= 5) return 'high';
+    if (numExperts >= 2 && total >= 3) return 'medium';
+    if (total > 0) return 'low';
+    return 'none';
+  }
+
+  // Detect consensus/conflict across answers for a given question
+  function consensusStatus(answers) {
+    if (answers.length <= 1) return '';
+    // Simple heuristic: if all answers are similar length and non-empty, mark as consensus
+    var allSame = true;
+    var firstLen = answers[0].a.length;
+    for (var i = 1; i < answers.length; i++) {
+      var diff = Math.abs(answers[i].a.length - firstLen);
+      if (diff > firstLen * 0.5) { allSame = false; break; }
+    }
+    if (allSame) return '**Consensus:** Multiple experts provided aligned answers on this topic.';
+    return '**Diverse perspectives:** Experts provided different emphases — cross-reference for completeness.';
+  }
+
+  function escYaml(s) {
+    if (!s) return '';
+    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+  }
+
+  function buildConceptFrontmatter(type, title, description, tags) {
+    var fm = '---\n';
+    fm += 'type: ' + type + '\n';
+    fm += 'title: ' + escYaml(title) + '\n';
+    fm += 'description: ' + escYaml(description) + '\n';
+    fm += 'tags: [' + tags.join(', ') + ']\n';
+    fm += 'timestamp: ' + timestamp + '\n';
+    fm += 'source: "' + escYaml(p.seed) + '"\n';
+    fm += '---\n';
+    return fm;
+  }
+
+  var bundle = {};
+  var categoryFileNames = [];
+
+  // Build concept files per category
+  var catKeys = Object.keys(categoryMeta);
+  for (var ck = 0; ck < catKeys.length; ck++) {
+    var cat = catKeys[ck];
+    var catAnswers = byCategory[cat];
+    var meta = categoryMeta[cat];
+    var fileName = cat + '.md';
+    categoryFileNames.push(fileName);
+    var body = buildConceptFrontmatter('Concept', meta.title + ' — ' + p.name, meta.description, ['chop', 'knowledge-capture', cat]);
+    body += '\n# ' + meta.title + '\n\n';
+    body += meta.description + '\n\n';
+    body += 'Part of the **[Knowledge Bundle](./index.md)** for *' + p.name + '*.\n\n';
+    body += '**Confidence:** ' + confidenceLevel(catAnswers || []) + '\n\n';
+    body += '## Answers\n\n';
+    if (!catAnswers || catAnswers.length === 0) {
+      body += '*No answers recorded for this category.*\n';
+    } else {
+      for (var ca = 0; ca < catAnswers.length; ca++) {
+        var q = catAnswers[ca];
+        body += '### ' + q.q + '\n\n';
+        body += '> **Question ID:** ' + q.qid + '\n\n';
+        for (var ai = 0; ai < q.answers.length; ai++) {
+          body += '<details>\n<summary><strong>' + escHtml(q.answers[ai].name) + '</strong> answered:</summary>\n\n';
+          body += q.answers[ai].a + '\n\n';
+          body += '</details>\n\n';
+        }
+        var cs = consensusStatus(q.answers);
+        if (cs) body += cs + '\n\n';
+        body += '---\n\n';
+      }
+    }
+    // Cross-link to other categories
+    body += '## Related\n\n';
+    body += '- [Back to Bundle Index](./index.md)\n';
+    for (var cl = 0; cl < catKeys.length; cl++) {
+      if (catKeys[cl] !== cat && byCategory[catKeys[cl]]) {
+        body += '- [' + categoryMeta[catKeys[cl]].title + '](./' + catKeys[cl] + '.md)\n';
+      }
+    }
+    var respondentLinks = '';
+    for (var rl = 0; rl < respondents.length; rl++) {
+      respondentLinks += '- ' + respondents[rl].name + '\n';
+    }
+    if (respondentLinks) {
+      body += '\n## Contributors\n\n' + respondentLinks;
+    }
+    bundle[fileName] = body;
+  }
+
+  // Build index.md
+  var indexBody = '---\n';
+  indexBody += 'type: KnowledgeBundle\n';
+  indexBody += 'title: ' + escYaml(p.name) + '\n';
+  indexBody += 'description: "Chop-captured knowledge generated from expert interviews about: ' + escYaml(p.seed) + '"\n';
+  indexBody += 'tags: [chop, knowledge-capture, bundle]\n';
+  indexBody += 'timestamp: ' + timestamp + '\n';
+  indexBody += 'okf_version: "0.1"\n';
+  indexBody += 'source: "' + escYaml(p.seed) + '"\n';
+  indexBody += '---\n\n';
+  indexBody += '# ' + p.name + '\n\n';
+  indexBody += 'Captured on ' + dateStr + ' via **Chop** — an interview-loop knowledge capture tool.\n\n';
+  indexBody += '## Metadata\n\n';
+  indexBody += '- **Seed:** ' + p.seed + '\n';
+  indexBody += '- **Respondents:** ' + respondents.map(function(e){return e.name}).join(', ') + '\n';
+  indexBody += '- **Questions Answered:** ' + all.length + '\n';
+  indexBody += '- **Categories:** ' + Object.keys(byCategory).length + '\n\n';
+  indexBody += '## Concepts\n\n';
+  for (var ic = 0; ic < catKeys.length; ic++) {
+    var icat = catKeys[ic];
+    var imeta = categoryMeta[icat];
+    var icount = (byCategory[icat] || []).length;
+    indexBody += '- [' + imeta.title + '](' + icat + '.md) — ' + imeta.description;
+    if (icount > 0) indexBody += ' (' + icount + ' question' + (icount > 1 ? 's' : '') + ')';
+    indexBody += '\n';
+  }
+  indexBody += '\n## Contributors\n\n';
+  for (var ic2 = 0; ic2 < respondents.length; ic2++) {
+    indexBody += '- ' + respondents[ic2].name + '\n';
+  }
+  bundle['index.md'] = indexBody;
+
+  // Build log.md
+  var logBody = '---\n';
+  logBody += 'type: Log\n';
+  logBody += 'title: Capture Log — ' + p.name + '\n';
+  logBody += 'tags: [chop, log]\n';
+  logBody += 'timestamp: ' + timestamp + '\n';
+  logBody += '---\n\n';
+  logBody += '# Capture Log\n\n';
+  logBody += '## ' + dateStr + '\n';
+  logBody += '* **Creation:** Bundle created from Chop capture session.\n';
+  logBody += '* **Seed:** "' + p.seed + '"\n';
+  logBody += '* **Respondents:** ' + respondents.length + ' expert' + (respondents.length !== 1 ? 's' : '') + ' contributed.\n';
+  logBody += '* **Total answers:** ' + all.length + '\n';
+  for (var lc = 0; lc < respondents.length; lc++) {
+    logBody += '* **' + respondents[lc].name + '** completed ' + respondents[lc].answered + ' question' + (respondents[lc].answered !== 1 ? 's' : '') + '.\n';
+  }
+  bundle['log.md'] = logBody;
+
   p.status = 'synthesized';
   await store.put('project:'+pid, JSON.stringify(p));
-  logEvent(env, 'synthesis_completed', {pid, respondents:experts.filter(function(e){return e.answered>0}).length, answers:all.length});
-  return json({markdown:md});
+  logEvent(env, 'synthesis_completed', {pid, respondents:respondents.length, answers:all.length});
+  return json({markdown:md, bundle:bundle});
 }
 
 async function getEvents(req, env) {
