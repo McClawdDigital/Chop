@@ -251,17 +251,17 @@ async function homePage(req, env) {
 }
 
 async function answerPage(req, env, token) {
-  var expertStr = await store.get('expert:' + token);
-  if (!expertStr) {
+  var experts = await sbQuery(env, 'chop_experts?token=eq.' + token + '&select=*');
+  var expert = experts && experts[0];
+  if (!expert) {
     return new Response(shell(
       '<div style="text-align:center;padding:60px 0"><div class="logo" style="font-size:3rem">\u{1FA97}</div><h1>Link not found</h1><p style="color:#888;margin:16px 0">This answer link doesn\'t exist or has expired.</p><a href="/" class="btn">Start your own project</a></div>',
       'Chop - Link not found'
     ), {headers:{'Content-Type':'text/html'}});
   }
-  var expert = JSON.parse(expertStr);
-  var pStr = await store.get('project:' + expert.project_id);
-  if (!pStr) return new Response('Not found', {status:404});
-  var project = JSON.parse(pStr);
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + expert.project_id + '&select=*');
+  var project = projects && projects[0];
+  if (!project) return new Response('Not found', {status:404});
 
   return new Response(shell(
     '<div id="answer-app" style="padding:20px 0">'+
@@ -306,172 +306,163 @@ async function answerPage(req, env, token) {
 }
 
 async function adminPage(req, env) {
-  var listStr = await store.get('projects_list');
-  var ids = listStr ? JSON.parse(listStr) : [];
-  var evStr = await store.get('admin_events');
-  var evs = evStr ? JSON.parse(evStr) : [];
+  var uid = getUserId(req, env);
+  if (!uid) return new Response(shell('<div style="text-align:center;padding:60px 0"><h1>Unauthorized</h1><p style="color:#888;margin:16px 0">Please log in first.</p><a href="/" class="btn">Go Home</a></div>', 'Chop - Unauthorized'), {headers:{'Content-Type':'text/html'}});
+
+  var projects = await sbQuery(env, 'chop_projects?select=*');
+  if (!projects) projects = [];
 
   var pHtml = '';
-  for (var i = 0; i < ids.length; i++) {
-    var pStr = await store.get('project:' + ids[i]);
-    if (!pStr) continue;
-    var p = JSON.parse(pStr);
-    var eStr = await store.get('project_experts:' + ids[i]);
-    var exps = eStr ? JSON.parse(eStr) : [];
+  for (var i = 0; i < projects.length; i++) {
+    var p = projects[i];
+    var experts = await sbQuery(env, 'chop_experts?project_id=eq.' + p.id + '&select=*');
+    if (!experts) experts = [];
     var rows = '';
-    for (var j = 0; j < exps.length; j++) {
-      var e = exps[j];
+    for (var j = 0; j < experts.length; j++) {
+      var e = experts[j];
       rows += '<tr><td>'+escHtml(e.name)+'</td><td>'+(e.email||'-')+'</td><td>'+e.status+'</td><td>'+(e.answered||0)+'/'+(e.total_questions||'?')+'</td></tr>';
     }
     pHtml += '<div class="card" style="margin-bottom:16px">'+
       '<div class="flex-between" style="margin-bottom:8px"><div><strong>'+escHtml(p.name)+'</strong> <span class="tag">'+p.status+'</span></div><span style="color:#666;font-size:0.8rem">'+(p.created_at||'')+'</span></div>'+
-      '<div style="font-size:0.85rem;color:#888;margin-bottom:8px">'+escHtml(p.seed.slice(0,150))+'</div>'+
-      (exps.length > 0 ? '<table class="admin-table"><tr><th>Expert</th><th>Email</th><th>Status</th><th>Progress</th></tr>'+rows+'</table>' : '<span style="color:#666;font-size:0.8rem">No experts added</span>')+
-      '<div style="margin-top:8px;font-size:0.8rem;color:#666">Questions: '+(p.questions||[]).length+' | Experts: '+exps.length+'</div></div>';
-  }
-
-  var evHtml = '';
-  for (var k = Math.max(0, evs.length - 50); k < evs.length; k++) {
-    var ev = evs[k];
-    var pp = typeof ev.payload === 'string' ? ev.payload : JSON.stringify(ev.payload || {});
-    evHtml += '<tr><td style="white-space:nowrap">'+ev.ts+'</td><td><span class="tag">'+ev.type+'</span></td><td><code class="inline-code">'+escHtml(pp.slice(0,120))+'</code></td></tr>';
+      '<div style="font-size:0.85rem;color:#888;margin-bottom:8px">'+escHtml((p.seed||'').slice(0,150))+'</div>'+
+      (experts.length > 0 ? '<table class="admin-table"><tr><th>Expert</th><th>Email</th><th>Status</th><th>Progress</th></tr>'+rows+'</table>' : '<span style="color:#666;font-size:0.8rem">No experts added</span>')+
+      '<div style="margin-top:8px;font-size:0.8rem;color:#666">Questions: '+(p.questions||[]).length+' | Experts: '+experts.length+'</div></div>';
   }
 
   return new Response(shell(
-    '<div class="flex-between" style="margin-bottom:16px"><div><div class="logo" style="font-size:1.5rem">\u{1FA97}</div><h1>Admin</h1><div class="sub">Observe user behavior</div></div><div><a href="/" class="btn btn-secondary btn-sm" style="text-decoration:none">Home</a></div></div>'+
-    '<div class="card"><h3>Projects ('+ids.length+')</h3>'+(ids.length === 0 ? '<div style="color:#666;padding:20px 0;text-align:center">No projects yet</div>' : pHtml)+'</div>'+
-    '<div class="card"><div class="flex-between" style="margin-bottom:12px"><h3>Event Log (last 50)</h3><div style="font-size:0.8rem;color:#666">Total: '+evs.length+'</div></div>'+
-    '<table class="admin-table"><tr><th>Time</th><th>Type</th><th>Payload</th></tr><tbody id="events-body">'+(evHtml || '<tr><td colspan="3" style="color:#666;text-align:center;padding:20px">No events yet</td></tr>')+'</tbody></table></div>',
-    'Chop Admin',
-    'setInterval(async function(){var r=await fetch("/api/admin/events");var d=await r.json();var tb=document.getElementById("events-body");if(!tb)return;'+
-    'tb.innerHTML=d.events.slice(-50).reverse().map(function(e){var p=typeof e.payload==="string"?e.payload:JSON.stringify(e.payload||{});return"<tr><td>"+e.ts+'+
-    '"</td><td><span class=\\"tag\\">"+e.type+"</span></td><td><code class=\\"inline-code\\">"+p.slice(0,120)+"</code></td></tr>"}).join("")},5000)'
+    '<div class="flex-between" style="margin-bottom:16px"><div><div class="logo" style="font-size:1.5rem">\u{1FA97}</div><h1>Admin</h1><div class="sub">All projects</div></div><div><a href="/" class="btn btn-secondary btn-sm" style="text-decoration:none">Home</a></div></div>'+
+    '<div class="card"><h3>Projects ('+projects.length+')</h3>'+(projects.length === 0 ? '<div style="color:#666;padding:20px 0;text-align:center">No projects yet</div>' : pHtml)+'</div>',
+    'Chop Admin'
   ), {headers:{'Content-Type':'text/html'}});
 }
 
-// API
+async function getEvents(req, env) {
+  return json({events: []});
+}
+
 async function createProject(req, env) {
   var body = await req.json();
   if (!body.seed || body.seed.length < 5) return json({error:'Seed too short'}, 400);
-  var id = t(12), ot = t(8), name = body.seed.split('.')[0].slice(0,40).trim() || 'Untitled';
-
-  // Generate questions via AI, with fallback to static defaults
   var questions = await generateQuestions(body.seed, env);
-
-  var project = {id, owner_token:ot, name, seed:body.seed, questions, status:'questions_generated', created_at:new Date().toISOString()};
-  await store.put('project:'+id, JSON.stringify(project));
-  await store.put('owner:'+ot+':project', id);
-  var list = JSON.parse(await store.get('projects_list') || '[]');
-  list.push(id); await store.put('projects_list', JSON.stringify(list));
-  logEvent(env, 'project_created', {id, name, qs:questions.length, ai_generated:questions !== DEFAULT_QUESTIONS});
-  return json({...project});
+  var name = body.seed.split('.')[0].slice(0,40).trim() || 'Untitled';
+  var result = await sbQuery(env, 'chop_projects', {
+    method: 'POST',
+    body: {name: name, seed: body.seed, questions: questions, status: 'questions_generated', user_id: '00000000-0000-0000-0000-000000000000'}
+  });
+  var project = result && result[0];
+  if (!project) return json({error:'Failed to create project'}, 500);
+  var ot = t(8);
+  return json({...project, owner_token: ot});
 }
 
 async function addExpert(req, env, pid) {
-  var ot = req.headers.get('X-Owner-Token');
-  var pStr = await store.get('project:'+pid);
-  if (!pStr) return json({error:'Not found'}, 404);
-  var p = JSON.parse(pStr);
-  if (p.owner_token !== ot) return json({error:'Unauthorized'}, 403);
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + pid + '&select=*');
+  var p = projects && projects[0];
+  if (!p) return json({error:'Not found'}, 404);
   var body = await req.json();
   if (!body.name) return json({error:'Name required'}, 400);
-  var et = t(8), ei = t(6);
-  var experts = JSON.parse(await store.get('project_experts:'+pid) || '[]');
-  var expert = {id:ei, name:body.name, email:body.email||'', token:et, status:'pending', answered:0, total_questions:DEFAULT_QUESTIONS.length, project_id:pid};
-  experts.push(expert);
-  await store.put('project_experts:'+pid, JSON.stringify(experts));
-  await store.put('expert:'+et, JSON.stringify(expert));
-  logEvent(env, 'expert_added', {pid, name:body.name});
+  var et = t(8);
+  var result = await sbQuery(env, 'chop_experts', {
+    method: 'POST',
+    body: {project_id: pid, name: body.name, email: body.email||'', token: et, status:'pending', answered:0, total_questions: (p.questions||DEFAULT_QUESTIONS).length}
+  });
+  var expert = result && result[0];
+  if (!expert) return json({error:'Failed to add expert'}, 500);
   return json({expert});
 }
 
 async function listExperts(req, env, pid) {
-  var ot = req.headers.get('X-Owner-Token');
-  var pStr = await store.get('project:'+pid);
-  if (!pStr) return json({error:'Not found'}, 404);
-  var p = JSON.parse(pStr);
-  if (p.owner_token !== ot) return json({error:'Unauthorized'}, 403);
-  var experts = JSON.parse(await store.get('project_experts:'+pid) || '[]');
+  var experts = await sbQuery(env, 'chop_experts?project_id=eq.' + pid + '&select=*');
+  if (!experts) experts = [];
   return json({experts: experts.map(function(e){return {...e, link:'/answer/'+e.token}})});
 }
 
 async function getProject(req, env, pid) {
-  var pStr = await store.get('project:'+pid);
-  if (!pStr) return json({error:'Not found'}, 404);
-  var p = JSON.parse(pStr);
-  var experts = JSON.parse(await store.get('project_experts:'+pid) || '[]');
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + pid + '&select=*');
+  var p = projects && projects[0];
+  if (!p) return json({error:'Not found'}, 404);
+  var experts = await sbQuery(env, 'chop_experts?project_id=eq.' + pid + '&select=*');
+  if (!experts) experts = [];
   return json({...p, experts});
 }
 
 async function expertQuestions(req, env, token) {
-  var eStr = await store.get('expert:'+token);
-  if (!eStr) return json({error:'Not found'}, 404);
-  var expert = JSON.parse(eStr);
-  if (expert.status === 'pending' || expert.status === 'sent') {
-    expert.status = 'in_progress';
-    await store.put('expert:'+token, JSON.stringify(expert));
-    updateExpert(env, expert.project_id, expert.id, {status:'in_progress'});
-    logEvent(env, 'expert_started', {pid:expert.project_id, name:expert.name});
-  }
-  var ak = 'assignments:'+expert.project_id+':'+token;
-  var aStr = await store.get(ak);
-  var as = aStr ? JSON.parse(aStr) : DEFAULT_QUESTIONS.map(function(q,i){return {idx:i, qid:q.qid, category:q.category, text:q.text, answered:false, skipped:false, answer:null}});
-  if (!aStr) await store.put(ak, JSON.stringify(as));
+  var experts = await sbQuery(env, 'chop_experts?token=eq.' + token + '&select=*');
+  var expert = experts && experts[0];
+  if (!expert) return json({error:'Not found'}, 404);
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + expert.project_id + '&select=name,questions');
+  var project = projects && projects[0];
+  if (!project) return json({error:'Not found'}, 404);
+  var questions = project.questions || DEFAULT_QUESTIONS;
+  var answers = await sbQuery(env, 'chop_answers?expert_id=eq.' + expert.id + '&select=*');
+  if (!answers) answers = [];
+  var as = questions.map(function(q, i) {
+    var existing = answers.find(function(a) { return a.question_id === q.qid; });
+    return {idx:i, qid:q.qid, category:q.category, text:q.text, answered:!!(existing && existing.answer), skipped: existing ? existing.skipped : false, answer: existing ? existing.answer : null};
+  });
+  await sbQuery(env, 'chop_experts?id=eq.' + expert.id, {method:'PATCH', body:{status:'in_progress'}});
   var ci = as.findIndex(function(a){return !a.answered && !a.skipped});
   return json({assignments:as, current_index:ci >= 0 ? ci : as.length});
 }
 
 async function submitAnswer(req, env, token) {
   var body = await req.json();
-  var eStr = await store.get('expert:'+token);
-  if (!eStr) return json({error:'Not found'}, 404);
-  var expert = JSON.parse(eStr);
-  var ak = 'assignments:'+expert.project_id+':'+token;
-  var aStr = await store.get(ak);
-  if (!aStr) return json({error:'No assignments'}, 400);
-  var as = JSON.parse(aStr);
-  var idx = body.idx;
-  if (idx < 0 || idx >= as.length) return json({error:'Invalid index'}, 400);
-  as[idx].answered = !body.skip;
-  as[idx].skipped = !!body.skip;
-  as[idx].answer = body.skip ? null : (body.text || '');
-  as[idx].answered_at = new Date().toISOString();
-  await store.put(ak, JSON.stringify(as));
-  var answered = as.filter(function(a){return a.answered}).length;
-  var skipped = as.filter(function(a){return a.skipped}).length;
-  var remaining = as.length - answered - skipped;
-  expert.answered = answered;
-  if (remaining === 0) {
-    expert.status = 'completed';
-    updateExpert(env, expert.project_id, expert.id, {status:'completed', answered});
-    logEvent(env, 'expert_completed', {pid:expert.project_id, name:expert.name, answered, skipped});
+  var experts = await sbQuery(env, 'chop_experts?token=eq.' + token + '&select=*');
+  var expert = experts && experts[0];
+  if (!expert) return json({error:'Not found'}, 404);
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + expert.project_id + '&select=name,questions');
+  var project = projects && projects[0];
+  if (!project) return json({error:'Not found'}, 404);
+  var questions = project.questions || DEFAULT_QUESTIONS;
+  if (body.idx < 0 || body.idx >= questions.length) return json({error:'Invalid index'}, 400);
+  var q = questions[body.idx];
+  var ans = body.skip ? null : (body.text || '');
+  // Upsert answer
+  var existing = await sbQuery(env, 'chop_answers?expert_id=eq.' + expert.id + '&question_id=eq.' + q.qid + '&select=*');
+  if (existing && existing.length > 0) {
+    var ts = new Date().toISOString();
+    await sbQuery(env, 'chop_answers?id=eq.' + existing[0].id, {method:'PATCH', body:{answer: ans, skipped: !!body.skip, answered_at: ts}});
   } else {
-    updateExpert(env, expert.project_id, expert.id, {answered});
+    await sbQuery(env, 'chop_answers', {method:'POST', body:{project_id: expert.project_id, expert_id: expert.id, question_id: q.qid, question_text: q.text, category: q.category, answer: ans, skipped: !!body.skip}});
   }
-  await store.put('expert:'+token, JSON.stringify(expert));
-  logEvent(env, body.skip ? 'answer_skipped' : 'answer_submitted', {pid:expert.project_id, name:expert.name, q:as[idx].qid});
+  // Count progress
+  var allAnswers = await sbQuery(env, 'chop_answers?expert_id=eq.' + expert.id + '&select=*');
+  if (!allAnswers) allAnswers = [];
+  var answered = allAnswers.filter(function(a){return !a.skipped && a.answer;}).length;
+  var skipped = allAnswers.filter(function(a){return a.skipped;}).length;
+  var remaining = questions.length - answered - skipped;
+  if (remaining <= 0) {
+    await sbQuery(env, 'chop_experts?id=eq.' + expert.id, {method:'PATCH', body:{answered: answered, status:'completed'}});
+  } else {
+    await sbQuery(env, 'chop_experts?id=eq.' + expert.id, {method:'PATCH', body:{answered: answered}});
+  }
+  // Rebuild assignments
+  var as = questions.map(function(qn, i) {
+    var ea = allAnswers.find(function(a){return a.question_id === qn.qid;});
+    return {idx:i, qid:qn.qid, category:qn.category, text:qn.text, answered:!!(ea && ea.answer), skipped: ea ? ea.skipped : false, answer: ea ? ea.answer : null};
+  });
   var ci = as.findIndex(function(a){return !a.answered && !a.skipped});
   return json({assignments:as, current_index:ci >= 0 ? ci : as.length});
 }
 
 async function synthesize(req, env, pid) {
-  var ot = req.headers.get('X-Owner-Token');
-  var pStr = await store.get('project:'+pid);
-  if (!pStr) return json({error:'Not found'}, 404);
-  var p = JSON.parse(pStr);
-  if (p.owner_token !== ot) return json({error:'Unauthorized'}, 403);
-  var experts = JSON.parse(await store.get('project_experts:'+pid) || '[]');
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + pid + '&select=*');
+  var p = projects && projects[0];
+  if (!p) return json({error:'Not found'}, 404);
+  var experts = await sbQuery(env, 'chop_experts?project_id=eq.' + pid + '&select=*');
+  if (!experts) experts = [];
   var respondents = experts.filter(function(e){return e.answered > 0});
+  var allAnswers = await sbQuery(env, 'chop_answers?project_id=eq.' + pid + '&select=*');
+  if (!allAnswers) allAnswers = [];
   var all = [];
-  for (var i = 0; i < experts.length; i++) {
-    var ak = 'assignments:'+pid+':'+experts[i].token;
-    var aStr = await store.get(ak);
-    if (!aStr) continue;
-    var as = JSON.parse(aStr);
-    for (var j = 0; j < as.length; j++) {
-      if (as[j].answered && as[j].answer) {
-        all.push({name:experts[i].name, qid:as[j].qid, q:as[j].text, a:as[j].answer});
-      }
+  var expertMap = {};
+  for (var ei = 0; ei < experts.length; ei++) {
+    expertMap[experts[ei].id] = experts[ei].name;
+  }
+  for (var ai = 0; ai < allAnswers.length; ai++) {
+    var aa = allAnswers[ai];
+    if (aa.answer && !aa.skipped) {
+      all.push({name: expertMap[aa.expert_id] || 'Unknown', qid: aa.question_id, q: aa.question_text, a: aa.answer});
     }
   }
   var byQ = {};
@@ -678,49 +669,103 @@ async function synthesize(req, env, pid) {
   }
   bundle['log.md'] = logBody;
 
-  p.status = 'synthesized';
-  await store.put('project:'+pid, JSON.stringify(p));
-  logEvent(env, 'synthesis_completed', {pid, respondents:respondents.length, answers:all.length});
+  await sbQuery(env, 'chop_projects?id=eq.' + pid, {method:'PATCH', body:{status:'synthesized'}});
   return json({markdown:md, bundle:bundle});
 }
 
-async function getEvents(req, env) {
-  var str = await store.get('admin_events');
-  var evs = str ? JSON.parse(str) : [];
-  return json({events:evs.slice(-100).reverse()});
-}
-
 // Helpers
-async function updateExpert(env, pid, eid, updates) {
-  var str = await store.get('project_experts:'+pid);
-  if (!str) return;
-  var arr = JSON.parse(str);
-  for (var i = 0; i < arr.length; i++) {
-    if (arr[i].id === eid) { Object.assign(arr[i], updates); break; }
-  }
-  await store.put('project_experts:'+pid, JSON.stringify(arr));
-}
-
-async function logEvent(env, type, payload) {
-  try {
-    var str = await store.get('admin_events');
-    var arr = str ? JSON.parse(str) : [];
-    arr.push({ts:new Date().toISOString(), type, payload});
-    if (arr.length > 500) arr.splice(0, arr.length - 500);
-    await store.put('admin_events', JSON.stringify(arr));
-  } catch(e) { console.error('log:', e); }
-}
-
 function escHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function json(d, s) { return new Response(JSON.stringify(d), {status:s||200, headers:{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}}); }
 
-// In-memory store (no KV dependency) -- looks like a KV namespace
-// Also logs events to BigQuery queue_master_payloads table
-var store = {
-  _data: {},
-  async get(key) { return this._data[key] || null; },
-  async put(key, val) { this._data[key] = val; }
-};
+// Supabase REST API helpers
+function sbUrl(env) { return env.SUPABASE_URL; }
+function sbKey(env) { return env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY; }
+function sbAnonKey(env) { return env.SUPABASE_ANON_KEY; }
+
+async function sbQuery(env, path, opts) {
+  var url = env.SUPABASE_URL + '/rest/v1/' + path;
+  var headers = {
+    'apikey': sbKey(env),
+    'Authorization': 'Bearer ' + sbKey(env),
+    'Content-Type': 'application/json',
+    'Prefer': opts && opts.prefer ? opts.prefer : 'return=representation'
+  };
+  if (opts && opts.accept) headers['Accept'] = opts.accept;
+  var req = {method: opts && opts.method ? opts.method : 'GET', headers: headers};
+  if (opts && opts.body) req.body = JSON.stringify(opts.body);
+  var res = await fetch(url, req);
+  if (!res.ok) {
+    var txt = await res.text();
+    console.error('Supabase error', res.status, path, txt.slice(0,200));
+    return null;
+  }
+  if (opts && opts.noParse) return res;
+  if (res.status === 204 || !res.headers.get('content-type')) return null;
+  return await res.json();
+}
+
+async function sbAuth(env, path, body) {
+  var res = await fetch(env.SUPABASE_URL + '/auth/v1/' + path, {
+    method: 'POST',
+    headers: {'apikey': sbAnonKey(env), 'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  return {ok: res.ok, status: res.status, data: await res.json()};
+}
+
+function jwtUserId(token) {
+  try {
+    var parts = token.split('.');
+    if (parts.length !== 3) return null;
+    var payload = JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));
+    return payload.sub || null;
+  } catch(e) { return null; }
+}
+
+function getAuthToken(req) {
+  var auth = req.headers.get('Authorization');
+  if (auth && auth.startsWith('Bearer ')) return auth.slice(7);
+  var cookie = req.headers.get('Cookie') || '';
+  var m = cookie.match(/chop_token=([^;]+)/);
+  return m ? m[1] : null;
+}
+
+// Auth handlers
+async function handleSignup(req, env) {
+  var body = await req.json();
+  var r = await sbAuth(env, 'signup', {email: body.email, password: body.password});
+  if (!r.ok) return json({error: (r.data && (r.data.msg || r.data.error_description)) || 'Signup failed'}, 400);
+  return json({
+    user: r.data.user,
+    session: r.data.session ? {access_token: r.data.session.access_token, expires_in: r.data.session.expires_in} : null
+  });
+}
+
+async function handleLogin(req, env) {
+  var body = await req.json();
+  var r = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
+  if (!r.ok) return json({error: (r.data && (r.data.msg || r.data.error_description)) || 'Login failed'}, 401);
+  return json({user: r.data.user, access_token: r.data.access_token, expires_in: r.data.expires_in});
+}
+
+async function handleLogout(req, env) {
+  return json({ok: true});
+}
+
+async function handleMe(req, env) {
+  var token = getAuthToken(req);
+  if (!token) return json({user: null});
+  var uid = jwtUserId(token);
+  if (!uid) return json({user: null});
+  var r = await sbAuth(env, 'user', {});
+  if (!r.ok) return json({user: null});
+  return json({user: {id: uid, email: r.data && r.data.email}});
+}
+
+function getUserId(req, env) {
+  var token = getAuthToken(req);
+  return token ? jwtUserId(token) : null;
+}
 
 // Replace store with `store` -- the router still receives `env` for other uses
 // Routes
@@ -729,7 +774,13 @@ export default {
     var url = new URL(request.url);
     var path = url.pathname;
     var method = request.method;
-    if (method === 'OPTIONS') return new Response(null, {status:204, headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,PUT','Access-Control-Allow-Headers':'Content-Type,X-Owner-Token'}});
+    if (method === 'OPTIONS') return new Response(null, {status:204, headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,PUT','Access-Control-Allow-Headers':'Content-Type,X-Owner-Token,Authorization'}});
+
+    // Auth
+    if (path === '/auth/signup' && method === 'POST') return handleSignup(request, env);
+    if (path === '/auth/login' && method === 'POST') return handleLogin(request, env);
+    if (path === '/auth/logout' && method === 'POST') return handleLogout(request, env);
+    if (path === '/auth/me' && method === 'GET') return handleMe(request, env);
 
     if (path === '/api/projects' && method === 'POST') return createProject(request, env);
     if (path === '/api/admin/events') return getEvents(request, env);
