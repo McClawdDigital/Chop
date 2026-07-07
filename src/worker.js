@@ -22,52 +22,55 @@ const DEFAULT_QUESTIONS = [
 
 // AI-powered question generation -- adaptive, seed-decomposing
 // Calls OpenRouter to analyze the seed and produce specific questions
+// Reads API key from Supabase chop_config table so deploys don't need re-secret-ing
 async function generateQuestions(seed, env) {
-  var apiKey = env.OPENROUTER_API_KEY;
+  // Fetch API key from Supabase config
+  var apiKey = await fetchOpenRouterKey(env);
   if (!apiKey) {
-    console.error('generateQuestions: No OPENROUTER_API_KEY configured, falling back to defaults');
+    console.error('generateQuestions: Could not retrieve OPENROUTER_API_KEY from Supabase, falling back to defaults');
     return DEFAULT_QUESTIONS;
   }
 
-  var systemPrompt = `You are a knowledge-capture question designer. Your job is to analyze a seed topic and generate a targeted questionnaire.
+  var systemPrompt = `You are a knowledge-capture question designer. Your job is to decompose a seed topic into its concrete components, then generate deeply specific questions anchored to the actual nouns in that seed.
 
-## Your process (internal — do not output this analysis)
-1. **Decompose the seed**: Extract the domain/topic, identify what kind of knowledge is being sought (process, tooling, people, strategy, architecture, etc.), identify implied personas/stakeholders, and detect any explicit constraints or scope boundaries.
-2. **Generate 8-12 questions** across these 7 categories, but make them SPECIFIC to the seed — not generic templates:
-   - SCOPE: What's in/out, boundaries, covered areas
-   - PERSONA: Who needs this, what do they need to know
-   - PROCESS: Core flow, steps, tools, permissions
-   - PEOPLE: Who knows, who owns, who to ask
-   - GAP: What's missing, undocumented, unclear
-   - FAILURE: What goes wrong, common mistakes
-   - SOURCE: Where's the authoritative truth
+## STRUCTURED SEED DECOMPOSITION (internal — do not output this analysis)
+First, extract the following from the seed topic:
 
-## Rules
-- Each question must be clearly tailored to the seed topic. If the seed is about "deploying a React app to Cloudflare Pages", do NOT ask "What tools are used?" — ask "What specific Cloudflare Pages settings (build command, output directory, environment variables) are needed for this React app?"
-- Use concrete nouns and specifics from the seed in every question.
-- Return 8-12 questions.
-- Output ONLY a valid JSON array. No markdown fences, no commentary.
+1. **ENTITIES** — Named systems, tools, platforms, frameworks, datasets, services, or products mentioned or implied
+2. **ROLES** — Specific job titles, teams, personas, stakeholders implied by the topic
+3. **PROCESSES** — Workflows, pipelines, step sequences, approval gates, or operational rhythms
+4. **TOOLS** — Specific software, CLIs, UIs, APIs, dashboards, configuration files, or infrastructure components
+5. **CONSTRAINTS** — Security boundaries, compliance requirements, SLAs, scale limitations, or organizational policies
+6. **GAPS** — What is NOT covered by the seed, what the reader might be confused about, what is commonly under-documented
+
+Then generate 10-12 questions that are DEEPLY SPECIFIC — every question must reference at least one specific named thing extracted above.
+
+## Question design rules
+- Every question MUST contain concrete, named references from the seed. Do NOT use generic question patterns with the seed topic simply inserted.
+- If the seed mentions "Kubernetes" and "Helm", ask about "Helm chart values" and "kubeconfig context", not just "what tools are used?"
+- If the seed mentions "SOC 2 compliance" and "AWS", ask about "AWS Config rules" or "evidence collection for SOC 2 control A1.2", not just "what are the compliance requirements?"
+- Questions should feel like they were written by someone who already understands the domain and wants to surface undocumented specifics.
+- Cover categories that naturally fit the seed (scope, persona, process, people, gap, failure, source). You are NOT required to cover all 7 — pick the 4-6 that are most relevant, but do generate 10-12 total questions. Distribute questions across the selected categories naturally.
+- Output ONLY a valid JSON array. No markdown fences, no commentary, no explanation.
 - Each object: {"qid": "Q-CATEGORY-NN", "category": "scope|persona|process|people|gap|failure|source", "text": "the question text"}
 
-## Examples of good vs bad questions
+## Examples of anchored vs template questions
 
-Seed: "We need to document how our CI/CD pipeline works for deploying the frontend monorepo"
-BAD (generic): "What tools are used in the process?"
-GOOD (specific): "What specific CI/CD platform (GitHub Actions, CircleCI, etc.) runs the frontend monorepo pipeline, and what are the key workflow steps from PR merge to production deploy?"
+Seed: "Document how we deploy our React SPA frontend to Cloudflare Pages using GitHub Actions"
+ANCHORED (GOOD): "Which specific Cloudflare Pages project name and account ID are used for production, and what GitHub Actions workflow file (.github/workflows/deploy.yml) triggers the build — what are the exact branch triggers and environment secrets required?"
+GENERIC (BAD): "What tools are used in the deployment process?"
 
-BAD (generic): "Who are the key people involved?"
-GOOD (specific): "Who owns the CI/CD configuration for the frontend monorepo, and who needs to approve changes to the deploy pipeline?"
+Seed: "Capture the onboarding steps for a data engineer joining the analytics team, including Snowflake, dbt, Airflow, and Looker access"
+ANCHORED (GOOD): "Which Snowflake role (e.g., TRANSFORMER, ANALYST) is assigned to new data engineers, and who in the analytics team currently manages Snowflake warehouse grants and dbt Cloud project permissions?"
+GENERIC (BAD): "What tools does a new data engineer need?"
 
-Seed: "Document the onboarding process for new data engineers joining the analytics team"
-BAD (generic): "What is the core process?"
-GOOD (specific): "What are the step-by-step tasks a new data engineer must complete in their first week — from getting AWS IAM access to running their first dbt model in production?"
-
-BAD (generic): "What tools are needed?"
-GOOD (specific): "Which specific tools and platforms (dbt, Snowflake, Airflow, Looker, GitHub) does a new data engineer need accounts for, and who grants each access?"`;
+Seed: "Document the incident response process for production outages in our Kubernetes cluster (EKS, Istio, Datadog)"
+ANCHORED (GOOD): "When Datadog triggers a P1 alert for high error rate on the 'checkout-service' pod, what is the exact sequence of commands (kubectl, istioctl, etc.) the on-call engineer runs to diagnose and mitigate — and which Slack channel receives the alert notification?"
+GENERIC (BAD): "What happens during an incident?"`;
 
   var userPrompt = `Seed topic: "${seed}"
 
-Analyze this seed and generate 8-12 specific, targeted questions for a knowledge capture questionnaire. Make every question clearly tailored to this specific topic — use concrete nouns, specific tools, named roles, and real details from the seed. Do NOT use generic question templates.`;
+Decompose this seed topic into its specific entities, tools, roles, processes, constraints, and gaps. Then generate 10-12 deeply specific questions for a knowledge capture questionnaire. Every question must reference concrete, named things from the seed — not generic templates with the topic inserted. Output ONLY the JSON array, no other text.`;
 
   try {
     var response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -79,7 +82,7 @@ Analyze this seed and generate 8-12 specific, targeted questions for a knowledge
         'X-Title': 'Chop MVP'
       },
       body: JSON.stringify({
-        model: 'openai/gpt-4o-mini',
+        model: 'openai/gpt-4o',
         messages: [
           {role: 'system', content: systemPrompt},
           {role: 'user', content: userPrompt}
@@ -480,27 +483,7 @@ async function synthesize(req, env, pid) {
   var dateStr = now.toISOString().slice(0,10);
   var timestamp = now.toISOString();
 
-  // ---- Build backward-compatible flat markdown ----
-  var md = '# ' + p.name + ' - Context Summary\n';
-  md += '#version v1\n#generated ' + dateStr + '\n\n';
-  md += '## Metadata\n';
-  md += '- Seed: ' + p.seed + '\n';
-  md += '- Respondents: ' + respondents.map(function(e){return e.name}).join(', ') + '\n';
-  md += '- Questions Answered: ' + all.length + '\n';
-  md += '- Status: MVP raw answers\n\n';
-  md += '## Raw Answers by Question\n\n';
-  for (var m = 0; m < groups.length; m++) {
-    md += '---\n\n';
-    md += '<respondent>\n  <question id="' + groups[m].qid + '">\n    <prompt>' + groups[m].q + '</prompt>\n';
-    for (var n = 0; n < groups[m].answers.length; n++) {
-      md += '    <answer expert="' + groups[m].answers[n].name + '">' + groups[m].answers[n].a + '</answer>\n';
-    }
-    md += '  </question>\n</respondent>\n\n';
-  }
-  md += '--- End of Document ---\n';
-
-  // ---- Build OKF Bundle ----
-  // Group answers by category
+  // ---- Group answers by category (still needed for the prompt and bundle) ----
   var byCategory = {};
   for (var ci = 0; ci < groups.length; ci++) {
     var g = groups[ci];
@@ -520,7 +503,7 @@ async function synthesize(req, env, pid) {
     source:    {title: 'Source',    description: 'Authoritative sources of truth.'}
   };
 
-  // Determine confidence levels
+  // Determine confidence levels (kept for bundle building)
   function confidenceLevel(catAnswers) {
     var total = 0, expertsWithAnswer = {};
     for (var i = 0; i < catAnswers.length; i++) {
@@ -532,22 +515,8 @@ async function synthesize(req, env, pid) {
     var numExperts = Object.keys(expertsWithAnswer).length;
     if (numExperts >= 3 && total >= 5) return 'high';
     if (numExperts >= 2 && total >= 3) return 'medium';
-    if (total > 0) return 'low';
+    if (numExperts > 0) return 'low';
     return 'none';
-  }
-
-  // Detect consensus/conflict across answers for a given question
-  function consensusStatus(answers) {
-    if (answers.length <= 1) return '';
-    // Simple heuristic: if all answers are similar length and non-empty, mark as consensus
-    var allSame = true;
-    var firstLen = answers[0].a.length;
-    for (var i = 1; i < answers.length; i++) {
-      var diff = Math.abs(answers[i].a.length - firstLen);
-      if (diff > firstLen * 0.5) { allSame = false; break; }
-    }
-    if (allSame) return '**Consensus:** Multiple experts provided aligned answers on this topic.';
-    return '**Diverse perspectives:** Experts provided different emphases — cross-reference for completeness.';
   }
 
   function escYaml(s) {
@@ -567,40 +536,230 @@ async function synthesize(req, env, pid) {
     return fm;
   }
 
-  var bundle = {};
-  var categoryFileNames = [];
+  // ---- Build the AI synthesis prompt ----
+  var answerBlocks = '';
+  for (var gi = 0; gi < groups.length; gi++) {
+    var g = groups[gi];
+    var cat = qidToCategory[g.qid] || 'uncategorized';
+    answerBlocks += '## Question: ' + g.q + '\n';
+    answerBlocks += 'QID: ' + g.qid + ' | Category: ' + cat + '\n';
+    for (var ai = 0; ai < g.answers.length; ai++) {
+      answerBlocks += '- **' + g.answers[ai].name + '**: ' + g.answers[ai].a + '\n';
+    }
+    answerBlocks += '\n';
+  }
 
-  // Build concept files per category
+  var systemPrompt = 'You are an expert knowledge synthesizer. Given raw expert interview answers about a topic, your job is to produce a coherent, structured knowledge document.';
+  systemPrompt += ' Identify consensus statements, flag divergences or disagreements, highlight uncertainty, and extract actionable takeaways.';
+  systemPrompt += ' Output valid markdown. Be thorough but concise.';
+
+  var userPrompt = 'Synthesize the following expert answers into a structured knowledge document.\n\n';
+  userPrompt += 'Project: ' + p.name + '\n';
+  userPrompt += 'Seed topic: ' + p.seed + '\n\n';
+  userPrompt += '## Expert Answers\n\n';
+  userPrompt += answerBlocks;
+  userPrompt += '\n\nProduce a markdown document with the following sections:\n';
+  userPrompt += '1. **Executive Summary** — 2-3 paragraph synthesis of the key takeaways from all answers.\n';
+  userPrompt += '2. **Key Insights by Category** — For each category that has answers, provide: consensus statements (what experts agreed on), divergence notes (where they disagreed or offered different perspectives), and uncertainty flags (areas lacking data).\n';
+  userPrompt += '3. **Actionable Takeaways** — Concrete next steps, decisions, or actions implied by the knowledge.\n';
+  userPrompt += '4. **Gaps & Recommended Follow-ups** — What is missing or needs further investigation.\n\n';
+  userPrompt += 'Format: clean markdown. Use headings, bullet points, and **bold** for emphasis. Do NOT wrap in code fences.';
+
+  // ---- Call OpenRouter for AI synthesis ----
+  var apiKey = await fetchOpenRouterKey(env);
+  var md = '';
+  var mdFallback = '';
+
+  if (apiKey) {
+    try {
+      var response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey,
+          'HTTP-Referer': 'https://chop-mvp.nousresearch.com',
+          'X-Title': 'Chop MVP'
+        },
+        body: JSON.stringify({
+          model: 'openai/gpt-4o',
+          messages: [
+            {role: 'system', content: systemPrompt},
+            {role: 'user', content: userPrompt}
+          ],
+          temperature: 0.7,
+          max_tokens: 4000
+        })
+      });
+
+      if (response.ok) {
+        var data = await response.json();
+        var content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+        if (content) {
+          md = content.trim();
+          // Strip code fences if model adds them
+          if (md.startsWith('```markdown')) md = md.slice(12);
+          else if (md.startsWith('```')) md = md.slice(3);
+          if (md.endsWith('```')) md = md.slice(0, -3);
+          md = md.trim();
+        }
+      } else {
+        console.error('synthesize: API returned ' + response.status, await response.text());
+      }
+    } catch (e) {
+      console.error('synthesize: Exception calling OpenRouter', e.message);
+    }
+  } else {
+    console.error('synthesize: Could not retrieve OPENROUTER_API_KEY from Supabase');
+  }
+
+  // ---- Fallback: if AI call failed, produce a basic structured document ----
+  if (!md) {
+    md = '# ' + p.name + ' - Context Summary\n\n';
+    md += '> **Note:** AI synthesis was unavailable. This is a structured fallback document.\n\n';
+    md += '## Metadata\n';
+    md += '- **Seed:** ' + p.seed + '\n';
+    md += '- **Respondents:** ' + respondents.map(function(e){return e.name}).join(', ') + '\n';
+    md += '- **Questions Answered:** ' + all.length + '\n';
+    md += '- **Generated:** ' + dateStr + '\n\n';
+    md += '## Answers by Category\n\n';
+    var catKeys = Object.keys(categoryMeta);
+    for (var fci = 0; fci < catKeys.length; fci++) {
+      var cat = catKeys[fci];
+      var catAnswers = byCategory[cat];
+      var meta = categoryMeta[cat];
+      if (!catAnswers || catAnswers.length === 0) continue;
+      md += '### ' + meta.title + '\n\n';
+      md += '*Confidence: ' + confidenceLevel(catAnswers) + '*\n\n';
+      for (var fq = 0; fq < catAnswers.length; fq++) {
+        var q = catAnswers[fq];
+        md += '**' + q.q + '** (QID: ' + q.qid + ')\n\n';
+        for (var fa = 0; fa < q.answers.length; fa++) {
+          md += '- **' + q.answers[fa].name + ':** ' + q.answers[fa].a + '\n';
+        }
+        md += '\n';
+      }
+    }
+    md += '---\n';
+    md += '*Fallback document — no AI synthesis was performed.*\n';
+  }
+
+  // ---- Build AI-synthesized OKF Bundle ----
+  // The AI-produced md is used as the primary content. We also build a structured
+  // OKF bundle where concept files contain the AI-synthesized category insights.
+
+  // First, ask the model to produce per-category summaries for the bundle files.
+  var bundlePrompt = 'Based on the same expert answers below, produce a structured JSON output with per-category summaries.';
+  bundlePrompt += ' The JSON must have this exact structure:\n';
+  bundlePrompt += '{\n';
+  bundlePrompt += '  "category_summaries": {\n';
+  bundlePrompt += '    "scope": {"summary": "...", "consensus": ["..."], "divergence": ["..."], "takeaways": ["..."]},\n';
+  bundlePrompt += '    "persona": {...},\n';
+  bundlePrompt += '    ... only categories that have answers ...\n';
+  bundlePrompt += '  },\n';
+  bundlePrompt += '  "index_summary": "2-3 sentence bundle overview",\n';
+  bundlePrompt += '  "log_notes": "1-2 sentences on what was captured"\n';
+  bundlePrompt += '}\n\n';
+  bundlePrompt += 'Expert answers:\n' + answerBlocks;
+  bundlePrompt += '\n\nOutput ONLY the JSON object. No markdown fences, no commentary.';
+
+  var bundleJson = null;
+  if (apiKey) {
+    try {
+      var bundleResp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey,
+          'HTTP-Referer': 'https://chop-mvp.nousresearch.com',
+          'X-Title': 'Chop MVP'
+        },
+        body: JSON.stringify({
+          model: 'openai/gpt-4o',
+          messages: [
+            {role: 'system', content: 'You produce structured JSON summaries from expert answers. Output ONLY valid JSON.'},
+            {role: 'user', content: bundlePrompt}
+          ],
+          temperature: 0.5,
+          max_tokens: 3000
+        })
+      });
+
+      if (bundleResp.ok) {
+        var bundleData = await bundleResp.json();
+        var bundleContent = bundleData.choices && bundleData.choices[0] && bundleData.choices[0].message && bundleData.choices[0].message.content;
+        if (bundleContent) {
+          bundleContent = bundleContent.trim();
+          if (bundleContent.startsWith('```json')) bundleContent = bundleContent.slice(7);
+          else if (bundleContent.startsWith('```')) bundleContent = bundleContent.slice(3);
+          if (bundleContent.endsWith('```')) bundleContent = bundleContent.slice(0, -3);
+          bundleContent = bundleContent.trim();
+          bundleJson = JSON.parse(bundleContent);
+        }
+      } else {
+        console.error('synthesize: Bundle API returned ' + bundleResp.status, await bundleResp.text());
+      }
+    } catch (e) {
+      console.error('synthesize: Exception fetching bundle summaries', e.message);
+    }
+  }
+
+  // Build the bundle object
+  var bundle = {};
   var catKeys = Object.keys(categoryMeta);
-  for (var ck = 0; ck < catKeys.length; ck++) {
-    var cat = catKeys[ck];
-    var catAnswers = byCategory[cat];
-    var meta = categoryMeta[cat];
-    var fileName = cat + '.md';
-    categoryFileNames.push(fileName);
+
+  // Helper to create concept file content using AI summaries if available
+  function buildCategoryContent(cat, meta, catAnswers, bundleJson) {
     var body = buildConceptFrontmatter('Concept', meta.title + ' — ' + p.name, meta.description, ['chop', 'knowledge-capture', cat]);
     body += '\n# ' + meta.title + '\n\n';
     body += meta.description + '\n\n';
     body += 'Part of the **[Knowledge Bundle](./index.md)** for *' + p.name + '*.\n\n';
     body += '**Confidence:** ' + confidenceLevel(catAnswers || []) + '\n\n';
-    body += '## Answers\n\n';
-    if (!catAnswers || catAnswers.length === 0) {
-      body += '*No answers recorded for this category.*\n';
-    } else {
-      for (var ca = 0; ca < catAnswers.length; ca++) {
-        var q = catAnswers[ca];
-        body += '### ' + q.q + '\n\n';
-        body += '> **Question ID:** ' + q.qid + '\n\n';
-        for (var ai = 0; ai < q.answers.length; ai++) {
-          body += '<details>\n<summary><strong>' + escHtml(q.answers[ai].name) + '</strong> answered:</summary>\n\n';
-          body += q.answers[ai].a + '\n\n';
-          body += '</details>\n\n';
+
+    if (bundleJson && bundleJson.category_summaries && bundleJson.category_summaries[cat]) {
+      var cs = bundleJson.category_summaries[cat];
+      if (cs.summary) {
+        body += '## Summary\n\n' + cs.summary + '\n\n';
+      }
+      if (cs.consensus && cs.consensus.length > 0) {
+        body += '## Consensus\n\n';
+        for (var ci2 = 0; ci2 < cs.consensus.length; ci2++) {
+          body += '- ' + cs.consensus[ci2] + '\n';
         }
-        var cs = consensusStatus(q.answers);
-        if (cs) body += cs + '\n\n';
-        body += '---\n\n';
+        body += '\n';
+      }
+      if (cs.divergence && cs.divergence.length > 0) {
+        body += '## Divergence\n\n';
+        for (var di = 0; di < cs.divergence.length; di++) {
+          body += '- ' + cs.divergence[di] + '\n';
+        }
+        body += '\n';
+      }
+      if (cs.takeaways && cs.takeaways.length > 0) {
+        body += '## Takeaways\n\n';
+        for (var ti = 0; ti < cs.takeaways.length; ti++) {
+          body += '- ' + cs.takeaways[ti] + '\n';
+        }
+        body += '\n';
+      }
+    } else {
+      body += '## Answers\n\n';
+      if (!catAnswers || catAnswers.length === 0) {
+        body += '*No answers recorded for this category.*\n';
+      } else {
+        for (var ca = 0; ca < catAnswers.length; ca++) {
+          var q = catAnswers[ca];
+          body += '### ' + q.q + '\n\n';
+          body += '> **Question ID:** ' + q.qid + '\n\n';
+          for (var aii = 0; aii < q.answers.length; aii++) {
+            body += '<details>\n<summary><strong>' + escHtml(q.answers[aii].name) + '</strong> answered:</summary>\n\n';
+            body += q.answers[aii].a + '\n\n';
+            body += '</details>\n\n';
+          }
+          body += '---\n\n';
+        }
       }
     }
+
     // Cross-link to other categories
     body += '## Related\n\n';
     body += '- [Back to Bundle Index](./index.md)\n';
@@ -616,21 +775,37 @@ async function synthesize(req, env, pid) {
     if (respondentLinks) {
       body += '\n## Contributors\n\n' + respondentLinks;
     }
-    bundle[fileName] = body;
+    return body;
+  }
+
+  // Build concept files
+  for (var ck = 0; ck < catKeys.length; ck++) {
+    var cat = catKeys[ck];
+    var catAnswers = byCategory[cat];
+    var meta = categoryMeta[cat];
+    var fileName = cat + '.md';
+    bundle[fileName] = buildCategoryContent(cat, meta, catAnswers, bundleJson);
   }
 
   // Build index.md
+  var indexSummary = '';
+  if (bundleJson && bundleJson.index_summary) {
+    indexSummary = bundleJson.index_summary;
+  }
   var indexBody = '---\n';
   indexBody += 'type: KnowledgeBundle\n';
   indexBody += 'title: ' + escYaml(p.name) + '\n';
   indexBody += 'description: "Chop-captured knowledge generated from expert interviews about: ' + escYaml(p.seed) + '"\n';
   indexBody += 'tags: [chop, knowledge-capture, bundle]\n';
   indexBody += 'timestamp: ' + timestamp + '\n';
-  indexBody += 'okf_version: "0.1"\n';
+  indexBody += 'okf_version: "0.2"\n';
   indexBody += 'source: "' + escYaml(p.seed) + '"\n';
   indexBody += '---\n\n';
   indexBody += '# ' + p.name + '\n\n';
   indexBody += 'Captured on ' + dateStr + ' via **Chop** — an interview-loop knowledge capture tool.\n\n';
+  if (indexSummary) {
+    indexBody += indexSummary + '\n\n';
+  }
   indexBody += '## Metadata\n\n';
   indexBody += '- **Seed:** ' + p.seed + '\n';
   indexBody += '- **Respondents:** ' + respondents.map(function(e){return e.name}).join(', ') + '\n';
@@ -652,6 +827,10 @@ async function synthesize(req, env, pid) {
   bundle['index.md'] = indexBody;
 
   // Build log.md
+  var logNotes = '';
+  if (bundleJson && bundleJson.log_notes) {
+    logNotes = bundleJson.log_notes;
+  }
   var logBody = '---\n';
   logBody += 'type: Log\n';
   logBody += 'title: Capture Log — ' + p.name + '\n';
@@ -664,6 +843,9 @@ async function synthesize(req, env, pid) {
   logBody += '* **Seed:** "' + p.seed + '"\n';
   logBody += '* **Respondents:** ' + respondents.length + ' expert' + (respondents.length !== 1 ? 's' : '') + ' contributed.\n';
   logBody += '* **Total answers:** ' + all.length + '\n';
+  if (logNotes) {
+    logBody += '* **Notes:** ' + logNotes + '\n';
+  }
   for (var lc = 0; lc < respondents.length; lc++) {
     logBody += '* **' + respondents[lc].name + '** completed ' + respondents[lc].answered + ' question' + (respondents[lc].answered !== 1 ? 's' : '') + '.\n';
   }
@@ -766,6 +948,40 @@ function getUserId(req, env) {
   var token = getAuthToken(req);
   return token ? jwtUserId(token) : null;
 }
+
+// Fetches the OpenRouter API key from Supabase chop_config table
+// This avoids storing secrets as Worker env vars — just update the DB.
+async function fetchOpenRouterKey(env) {
+  try {
+    var resp = await fetch(env.SUPABASE_URL + '/rest/v1/chop_config?key=eq.openrouter_api_key&select=value', {
+      headers: {
+        'apikey': env.SUPABASE_ANON_KEY,
+        'Authorization': 'Bearer ' + env.SUPABASE_ANON_KEY
+      }
+    });
+    if (!resp.ok) {
+      console.error('fetchOpenRouterKey: HTTP ' + resp.status);
+      return null;
+    }
+    var data = await resp.json();
+    if (data && data.length > 0 && data[0].value) {
+      return data[0].value;
+    }
+    console.error('fetchOpenRouterKey: No config row found');
+    return null;
+  } catch(e) {
+    console.error('fetchOpenRouterKey: Error', e);
+    return null;
+  }
+}
+
+// In-memory store (no KV dependency) -- looks like a KV namespace
+// Also logs events to BigQuery queue_master_payloads table
+var store = {
+  _data: {},
+  async get(key) { return this._data[key] || null; },
+  async put(key, val) { this._data[key] = val; }
+};
 
 // Replace store with `store` -- the router still receives `env` for other uses
 // Routes
