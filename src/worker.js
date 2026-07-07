@@ -182,75 +182,251 @@ function shell(body, title, extra) {
   return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+(title||'Chop')+'</title><style>'+CSS+'</style></head><body><div class="container">'+body+'</div><div id="toast" class="toast"></div><script>function showToast(msg,d){var t=document.getElementById("toast");t.textContent=msg;t.classList.add("show");setTimeout(function(){t.classList.remove("show")},d||3000)}'+(extra||'')+'</script></body></html>';
 }
 
+// Auth UI helpers
+function authScript() {
+  return 'var tok=sessionStorage.getItem("chop_token");' +
+    'async function authFetch(u,o){if(!o)o={};o.headers=o.headers||{};if(tok)o.headers["Authorization"]="Bearer "+tok;return fetch(u,o)}' +
+    'async function getMe(){try{var r=await authFetch("/auth/me");return await r.json()}catch(e){return{user:null}}}' +
+    'async function logout(){sessionStorage.removeItem("chop_token");window.location.href="/"}';
+}
+
+function navBar(user) {
+  var items = '<div class="logo" style="font-size:1.2rem;margin-bottom:0">\u{1FA97}</div>';
+  items += '<div style="display:flex;align-items:center;gap:12px;flex:1;justify-content:flex-end">';
+  items += '<a href="/" style="color:#888;text-decoration:none;font-size:.85rem">Projects</a>';
+  if (user && user.email) {
+    items += '<span style="color:#666;font-size:.85rem">' + escHtml(user.email) + '</span>';
+    items += '<button class="btn btn-sm btn-secondary" onclick="logout()" style="cursor:pointer">Logout</button>';
+  } else {
+    items += '<a href="/login" class="btn btn-sm btn-secondary" style="text-decoration:none">Login</a>';
+    items += '<a href="/login" class="btn btn-sm" style="text-decoration:none;color:#000">Sign Up</a>';
+  }
+  items += '</div>';
+  return '<div class="flex-between" style="margin-bottom:24px;padding-bottom:12px;border-bottom:1px solid #2a2a2a">' + items + '</div>';
+}
+
 // Routes
 async function homePage(req, env) {
-  return new Response(shell(
-    '<div class="flex-between"><div><div class="logo">\u{1FA97}</div><h1>Chop</h1><div class="sub">Not a chatbot. An interview loop.</div></div><div><a href="/admin" class="btn btn-secondary btn-sm" style="text-decoration:none">Admin</a></div></div>'+
-    '<div class="card" id="new-project-card">'+
+  var token = getAuthToken(req);
+  var user = null;
+  if (token) {
+    var uid = jwtUserId(token);
+    if (uid) {
+      var r = await sbAuth(env, 'user', {});
+      if (r.ok) user = {id: uid, email: r.data && r.data.email};
+    }
+  }
+
+  var body = '';
+
+  if (user && user.email) {
+    // Logged in: show project dashboard
+    body += navBar(user);
+    body += '<div class="flex-between"><h1>Your Projects</h1></div>';
+    body += '<div id="dashboard-area"></div>';
+    body += '<div class="card" id="new-project-card" style="display:none">'+
       '<label>What do you want to capture?</label>'+
       '<textarea id="seed" placeholder="e.g. We need to document how our data pipeline works..."></textarea>'+
       '<div style="display:flex;gap:8px;align-items:center"><button class="btn" onclick="startProject()">Generate Questions</button><span style="color:#666;font-size:0.8rem" id="status-msg"></span></div>'+
-    '</div>'+
-    '<div id="project-area" style="display:none"></div>',
-    'Chop - Capture Knowledge',
-    'var cp=null;var ct="";'+
-    '(function(){var s=sessionStorage.getItem("chop_ot");if(s)ct=s})();'+
-    'async function startProject(){var s=document.getElementById("seed").value.trim();if(!s){showToast("Enter a topic first");return}'+
-    'var b=document.querySelector("#new-project-card .btn");b.disabled=true;b.textContent="Generating...";'+
-    'try{var r=await fetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seed:s})});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");'+
-    'sessionStorage.setItem("chop_ot",d.owner_token);sessionStorage.setItem("chop_pid",d.id);cp=d;showProject(d)}catch(e){showToast("Error: "+e.message)}'+
-    'b.disabled=false;b.textContent="Generate Questions"}'+
-    'function showProject(p){'+
-    'document.getElementById("new-project-card").style.display="none";var a=document.getElementById("project-area");a.style.display="block";'+
-    'var qh="";for(var i=0;i<p.questions.length;i++){var q=p.questions[i];'+
-    'qh+=\'<div style="padding:8px 0;border-bottom:1px solid #2a2a2a;display:flex;align-items:flex-start;gap:8px"><input type="checkbox" checked id="q-\'+i+\'" style="width:auto;margin-top:4px">\'+' +
-    '\'<div><span class="q-badge">\'+q.qid+\'</span> <span class="tag \'+q.category+\'">\'+q.category+\'</span><div style="margin-top:4px;color:#ccc;font-size:0.9rem">\'+q.text+\'</div></div></div>\''+
-    '}'+
-    'a.innerHTML=\'<div class="flex-between" style="margin-bottom:16px"><div><h2>\'+p.name+\'</h2><div class="sub" style="margin-bottom:0">\'+p.seed.slice(0,100)+\'...</div></div><span class="tag">\'+p.status+\'</span></div>\'+\'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><label style="margin-bottom:0;font-size:1rem">Questions (\'+p.questions.length+\')</label></div><div id="q-list">\'+qh+\'</div></div>\'+\'<div class="card"><label style="font-size:1rem">Add Experts</label><div style="margin-bottom:12px"><div class="expert-input-row"><input id="expert-name" placeholder="Name (e.g. Alice - Data Eng)" style="margin-bottom:0"><input id="expert-email" placeholder="Email (optional)" style="margin-bottom:0"><button class="btn btn-sm" onclick="addExpert()">+ Add</button></div></div><div id="expert-list"></div><div id="expert-links" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #333"></div><div id="progress-area" style="margin-top:12px;display:none"></div><div style="margin-top:12px"><button class="btn" id="synthesize-btn" style="display:none" onclick="triggerSynth()">Synthesize Now</button></div></div>\'+\'<div id="synthesis-output" style="display:none"></div>\';'+
-    'refreshExperts()}'+
-    'async function addExpert(){var n=document.getElementById("expert-name").value.trim();if(!n){showToast("Enter a name");return}'+
-    'var e=document.getElementById("expert-email").value.trim();var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");'+
-    'var r=await fetch("/api/projects/"+pid+"/experts",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok},body:JSON.stringify({name:n,email:e})});'+
-    'var d=await r.json();if(!r.ok){showToast(d.error||"Failed");return}'+
-    'document.getElementById("expert-name").value="";document.getElementById("expert-email").value="";refreshExperts()}'+
-    'async function refreshExperts(){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");'+
-    'var r=await fetch("/api/projects/"+pid+"/experts",{headers:{"X-Owner-Token":tok}});var d=await r.json();if(!r.ok)return;'+
-    'var el=document.getElementById("expert-list");var ll=document.getElementById("expert-links");var pa=document.getElementById("progress-area");var sb=document.getElementById("synthesize-btn");'+
-    'if(!d.experts||d.experts.length===0){el.innerHTML=\'<div style="color:#666;font-size:0.85rem">Add experts who have the knowledge you want to capture.</div>\';ll.style.display="none";pa.style.display="none";sb.style.display="none";return}'+
-    'el.innerHTML=d.experts.map(function(e){var sc="pending",st="Pending";if(e.status==="sent"){sc="pending";st="Sent"}if(e.status==="in_progress"){sc="in-progress";st="In Progress"}if(e.status==="completed"){sc="done";st="Done"}'+
-    'return\'<div class="expert-card"><div><div class="name">\'+e.name+\'</div><div style="font-size:0.75rem;color:#666;margin-top:2px">\'+(e.answered||0)+\'/\'+(e.total_questions||\'?\')+\' answered</div></div>\'+\'<div style="display:flex;align-items:center;gap:8px"><span class="status \'+sc+\'">\'+st+\'</span></div></div>\'}).join("");'+
-    'll.style.display="block";ll.innerHTML=\'<label>Share Links</label>\';'+
-    'd.experts.forEach(function(e){ll.innerHTML+=\'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:0.85rem"><span style="min-width:120px">\'+e.name+\'</span><code class="inline-code" style="flex:1">\'+window.location.origin+\'/answer/\'+e.token+\'</code></div>\'});'+
-    'var tot=d.experts.length;var done=d.experts.filter(function(e){return e.status==="completed"}).length;'+
-    'pa.style.display="block";pa.innerHTML=\'<div style="margin-top:8px;padding-top:12px;border-top:1px solid #333"><div class="progress"><span>People: \'+tot+\'</span><span>Done: \'+done+\'</span></div></div>\';'+
-    'var hasAns=d.experts.some(function(e){return parseInt(e.answered||0)>0});sb.style.display=hasAns?"inline-flex":"none"}'+
-        'async function triggerSynth(){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");var b=document.getElementById("synthesize-btn");b.disabled=true;b.textContent="Synthesizing...";'+
-        'try{var r=await fetch("/api/projects/"+pid+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok}});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");'+
-        'var o=document.getElementById("synthesis-output");o.style.display="block";'+
-        'var bundleHtml="";if(d.bundle){var bkeys=Object.keys(d.bundle);'+
-        'bundleHtml=\'<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">\';'+
-        'bundleHtml+=\'<button class="btn btn-sm" onclick="downloadBundle()">Download OKF Bundle (.zip)</button>\';'+
-        'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'index.md\')">index.md</button>\';'+
-        'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'log.md\')">log.md</button>\';'+
-        'bkeys.forEach(function(f){if(f!==\'index.md\'&&f!==\'log.md\'){bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'\'+f+\'\')">\'+f+\'</button>\'}});'+
-        'bundleHtml+=\'</div>\';}'+
-        'o.innerHTML=\'<div class="card"><h3>Output</h3><pre id="md-out">\'+escHtml(d.markdown)+\'</pre><div style="margin-top:12px"><button class="btn btn-sm" onclick="copyMd()">Copy Markdown</button></div>\'+bundleHtml+\'</div>\';showToast("Synthesis complete!")}catch(e){showToast("Error: "+e.message)}'+
-        'b.disabled=false;b.textContent="Synthesize Now"}'+
-        'function copyMd(){var p=document.getElementById("md-out");navigator.clipboard.writeText(p.textContent).then(function(){showToast("Copied!")})}'+
-        'function downloadBundle(){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");'+
-        'fetch("/api/projects/"+pid+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok}}).then(function(r){return r.json()}).then(function(d){'+
-        'if(!d.bundle){showToast("No bundle data");return}'+
-        'var zip=new JSZip();var bkeys=Object.keys(d.bundle);'+
-        'for(var i=0;i<bkeys.length;i++){zip.file(bkeys[i],d.bundle[bkeys[i]])}'+
-        'zip.generateAsync({type:"blob"}).then(function(blob){'+
-        'var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="okf-bundle-"+pid+".zip";a.click();'+
-        'URL.revokeObjectURL(a.href);showToast("Bundle downloaded!")})})}'+
-        'function downloadFile(fn){var pid=sessionStorage.getItem("chop_pid");var tok=sessionStorage.getItem("chop_ot");'+
-        'fetch("/api/projects/"+pid+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json","X-Owner-Token":tok}}).then(function(r){return r.json()}).then(function(d){'+
-        'if(!d.bundle||!d.bundle[fn]){showToast("File not found");return}'+
-        'var blob=new Blob([d.bundle[fn]],{type:"text/markdown"});var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=fn;a.click();URL.revokeObjectURL(a.href)})}'+
-        'function escHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}'
+    '</div>';
+
+    var extra = authScript() +
+      'var cp=null;' +
+      'async function loadDashboard(){' +
+      'try{var r=await authFetch("/api/projects");var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");renderDashboard(d.projects||[])}catch(e){showToast("Error: "+e.message)}' +
+      '}' +
+      'function renderDashboard(projects){' +
+      'var da=document.getElementById("dashboard-area");' +
+      'da.innerHTML=\'<div style="margin-bottom:16px"><button class="btn" onclick="showNewProject()" id="new-project-btn">+ New Project</button></div>\';' +
+      'if(projects.length===0){da.innerHTML+=\'<div class="card" style="text-align:center;padding:40px 0"><div style="color:#666;font-size:1rem">No projects yet.</div><div style="color:#555;font-size:0.85rem;margin-top:8px">Create your first project to capture knowledge.</div></div>\';return}' +
+      'da.innerHTML+=projects.map(function(p){' +
+      'var qc=p.questions?p.questions.length:0;' +
+      'return\'<div class="card project-card" style="cursor:pointer" onclick="window.location.href=\\\'/project/\'+p.id+\'\\\'">\' +' +
+      '\'<div class="flex-between"><div><strong>\'+escHtml(p.name||"Untitled")+\'</strong><span class="tag" style="margin-left:8px">\'+escHtml(p.status||"draft")+\'</span></div>\' +' +
+      '\'<span style="color:#666;font-size:0.8rem">\'+(p.created_at||"").slice(0,10)+\'</span></div>\' +' +
+      '\'<div style="font-size:0.85rem;color:#888;margin-top:4px">\'+escHtml((p.seed||"").slice(0,100))+\'</div>\' +' +
+      '\'<div style="font-size:0.8rem;color:#666;margin-top:8px">\'+qc+\' questions</div>\' +' +
+      '\'</div>\'}).join("")' +
+      '}' +
+      'function showNewProject(){document.getElementById("new-project-card").style.display="block";document.getElementById("new-project-btn").style.display="none"}' +
+      'async function startProject(){var s=document.getElementById("seed").value.trim();if(!s){showToast("Enter a topic first");return}' +
+      'var b=document.querySelector("#new-project-card .btn");b.disabled=true;b.textContent="Generating...";' +
+      'try{var r=await authFetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seed:s})});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");' +
+      'window.location.href="/project/"+d.id}catch(e){showToast("Error: "+e.message)}' +
+      'b.disabled=false;b.textContent="Generate Questions"}' +
+      'loadDashboard();';
+    return new Response(shell(body, 'Chop - Dashboard', extra), {headers:{'Content-Type':'text/html'}});
+  } else {
+    // Not logged in: show landing with login prompt
+    body += navBar(null);
+    body += '<div style="text-align:center;padding:40px 0">';
+    body += '<div class="logo" style="font-size:3rem;margin-bottom:16px">\u{1FA97}</div>';
+    body += '<h1>Chop</h1>';
+    body += '<div class="sub" style="font-size:1.1rem;margin-bottom:32px">Not a chatbot. An interview loop.</div>';
+    body += '<div style="max-width:400px;margin:0 auto">';
+    body += '<p style="color:#888;margin-bottom:24px">Capture expert knowledge by running structured interview loops. Create projects, invite experts, and synthesize their answers into knowledge documents.</p>';
+    body += '<a href="/login" class="btn" style="text-decoration:none;display:inline-block">Sign Up or Log In</a>';
+    body += '</div></div>';
+    return new Response(shell(body, 'Chop - Capture Knowledge', authScript()), {headers:{'Content-Type':'text/html'}});
+  }
+}
+
+async function loginPage(req, env) {
+  return new Response(shell(
+    navBar(null) +
+    '<div style="max-width:400px;margin:40px auto">' +
+      '<h1 style="text-align:center">Sign In</h1>' +
+      '<div class="card" style="margin-top:20px">' +
+        '<div id="login-form">' +
+          '<label>Email</label>' +
+          '<input type="email" id="login-email" placeholder="you@example.com" autocomplete="email">' +
+          '<label>Password</label>' +
+          '<input type="password" id="login-password" placeholder="Enter password" autocomplete="current-password">' +
+          '<div style="display:flex;gap:8px">' +
+            '<button class="btn" onclick="doLogin()" style="flex:1">Log In</button>' +
+            '<button class="btn btn-secondary" onclick="doSignup()" style="flex:1">Sign Up</button>' +
+          '</div>' +
+          '<div id="login-error" style="color:#f87171;font-size:0.85rem;margin-top:8px;display:none"></div>' +
+        '</div>' +
+        '<div id="login-success" style="display:none;text-align:center;padding:20px 0">' +
+          '<div style="font-size:2rem;margin-bottom:8px">\u2705</div>' +
+          '<div>Success! Redirecting...</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>',
+    'Chop - Login',
+    'async function doLogin(){var e=document.getElementById("login-email").value.trim();var p=document.getElementById("login-password").value;if(!e||!p){showToast("Enter email and password");return}' +
+    'try{var r=await fetch("/login/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:e,password:p})});var d=await r.json();' +
+    'if(!r.ok){var er=document.getElementById("login-error");er.textContent=d.error||"Login failed";er.style.display="block";return}' +
+    'sessionStorage.setItem("chop_token",d.access_token);document.getElementById("login-form").style.display="none";document.getElementById("login-success").style.display="block";' +
+    'setTimeout(function(){window.location.href="/"},1000)}catch(e){showToast("Error: "+e.message)}}' +
+    'async function doSignup(){var e=document.getElementById("login-email").value.trim();var p=document.getElementById("login-password").value;if(!e||!p){showToast("Enter email and password");return}' +
+    'try{var r=await fetch("/login/signup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:e,password:p})});var d=await r.json();' +
+    'if(!r.ok){var er=document.getElementById("login-error");er.textContent=d.error||"Signup failed";er.style.display="block";return}' +
+    'if(d.access_token){sessionStorage.setItem("chop_token",d.access_token)}' +
+    'document.getElementById("login-form").style.display="none";document.getElementById("login-success").style.display="block";' +
+    'setTimeout(function(){window.location.href="/"},1000)}catch(e){showToast("Error: "+e.message)}}'
   ), {headers:{'Content-Type':'text/html'}});
+}
+
+async function loginPost(req, env) {
+  var body = await req.json();
+  var r = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
+  if (!r.ok) {
+    var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Login failed';
+    return json({error: errMsg}, 401);
+  }
+  return json({user: r.data.user, access_token: r.data.access_token});
+}
+
+async function signupPost(req, env) {
+  var body = await req.json();
+  var r = await sbAuth(env, 'signup', {email: body.email, password: body.password});
+  if (!r.ok) {
+    var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Signup failed';
+    return json({error: errMsg}, 400);
+  }
+  // If auto-confirm is on, we get a session back
+  if (r.data && r.data.session && r.data.session.access_token) {
+    return json({user: r.data.user, access_token: r.data.session.access_token});
+  }
+  // Otherwise try logging in immediately
+  var loginR = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
+  if (loginR.ok && loginR.data && loginR.data.access_token) {
+    return json({user: loginR.data.user, access_token: loginR.data.access_token});
+  }
+  return json({user: r.data.user, access_token: null});
+}
+
+async function projectDetailPage(req, env, pid) {
+  var token = getAuthToken(req);
+  var user = null;
+  if (token) {
+    var uid = jwtUserId(token);
+    if (uid) {
+      var r = await sbAuth(env, 'user', {});
+      if (r.ok) user = {id: uid, email: r.data && r.data.email};
+    }
+  }
+  if (!user) {
+    return new Response(shell(
+      navBar(null) +
+      '<div style="text-align:center;padding:60px 0"><h1>Unauthorized</h1><p style="color:#888;margin:16px 0">Please log in to view this project.</p><a href="/login" class="btn">Log In</a></div>',
+      'Chop - Unauthorized'
+    ), {headers:{'Content-Type':'text/html'}});
+  }
+  return new Response(shell(
+    navBar(user) +
+    '<div id="project-area">' +
+      '<div id="project-loading" style="text-align:center;padding:40px 0;color:#888">Loading project...</div>' +
+    '</div>' +
+    '<div id="synthesis-output" style="display:none"></div>' +
+    '<div id="toast" class="toast"></div>',
+    'Chop - Project',
+    authScript() +
+    'var PID="'+pid+'";' +
+    'async function loadProject(){' +
+    'try{var r=await authFetch("/api/projects/"+PID);var p=await r.json();if(!r.ok)throw new Error(p.error||"Not found");renderProject(p)}catch(e){' +
+    'document.getElementById("project-loading").textContent="Error: "+e.message}}' +
+    'function renderProject(p){' +
+    'var a=document.getElementById("project-area");' +
+    'var qh="";for(var i=0;i<p.questions.length;i++){var q=p.questions[i];' +
+    'qh+=\'<div style="padding:8px 0;border-bottom:1px solid #2a2a2a;display:flex;align-items:flex-start;gap:8px"><input type="checkbox" checked id="q-\'+i+\'" style="width:auto;margin-top:4px">\'' +
+    '+\'<div><span class="q-badge">\'+q.qid+\'</span> <span class="tag \'+q.category+\'">\'+q.category+\'</span><div style="margin-top:4px;color:#ccc;font-size:0.9rem">\'+escHtml(q.text)+\'</div></div></div>\'}' +
+    'a.innerHTML=\'<div class="flex-between" style="margin-bottom:16px"><div><a href="/" style="color:#888;text-decoration:none;font-size:0.85rem">&larr; Back to Projects</a><h2 style="margin-top:4px">\'+escHtml(p.name)+\'</h2><div class="sub" style="margin-bottom:0">\'+escHtml(p.seed.slice(0,150))+\'</div></div><span class="tag">\'+escHtml(p.status)+\'</span></div>\'+\'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><label style="margin-bottom:0;font-size:1rem">Questions (\'+p.questions.length+\')</label></div><div id="q-list">\'+qh+\'</div></div>\'+\'<div class="card"><label style="font-size:1rem">Add Experts</label><div style="margin-bottom:12px"><div class="expert-input-row"><input id="expert-name" placeholder="Name (e.g. Alice - Data Eng)" style="margin-bottom:0"><input id="expert-email" placeholder="Email (optional)" style="margin-bottom:0"><button class="btn btn-sm" onclick="addExpert()">+ Add</button></div></div><div id="expert-list"></div><div id="expert-links" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #333"></div><div id="progress-area" style="margin-top:12px;display:none"></div><div style="margin-top:12px"><button class="btn" id="synthesize-btn" style="display:none" onclick="triggerSynth()">Synthesize Now</button></div></div>\';' +
+    'refreshExperts()}' +
+    'async function addExpert(){var n=document.getElementById("expert-name").value.trim();if(!n){showToast("Enter a name");return}' +
+    'var e=document.getElementById("expert-email").value.trim();' +
+    'var r=await fetch("/api/projects/"+PID+"/experts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:n,email:e})});' +
+    'var d=await r.json();if(!r.ok){showToast(d.error||"Failed");return}' +
+    'document.getElementById("expert-name").value="";document.getElementById("expert-email").value="";refreshExperts()}' +
+    'async function refreshExperts(){' +
+    'var r=await fetch("/api/projects/"+PID+"/experts");var d=await r.json();if(!r.ok)return;' +
+    'var el=document.getElementById("expert-list");var ll=document.getElementById("expert-links");var pa=document.getElementById("progress-area");var sb=document.getElementById("synthesize-btn");' +
+    'if(!d.experts||d.experts.length===0){el.innerHTML=\'<div style="color:#666;font-size:0.85rem">Add experts who have the knowledge you want to capture.</div>\';ll.style.display="none";pa.style.display="none";sb.style.display="none";return}' +
+    'el.innerHTML=d.experts.map(function(e){var sc="pending",st="Pending";if(e.status==="sent"){sc="pending";st="Sent"}if(e.status==="in_progress"){sc="in-progress";st="In Progress"}if(e.status==="completed"){sc="done";st="Done"}' +
+    'return\'<div class="expert-card"><div><div class="name">\'+escHtml(e.name)+\'</div><div style="font-size:0.75rem;color:#666;margin-top:2px">\'+(e.answered||0)+\'/\'+(e.total_questions||\'?\')+\' answered</div></div>\'+\'<div style="display:flex;align-items:center;gap:8px"><span class="status \'+sc+\'">\'+st+\'</span></div></div>\'}).join("");' +
+    'll.style.display="block";ll.innerHTML=\'<label>Share Links</label>\';' +
+    'd.experts.forEach(function(e){ll.innerHTML+=\'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:0.85rem"><span style="min-width:120px">\'+escHtml(e.name)+\'</span><code class="inline-code" style="flex:1">\'+window.location.origin+\'/answer/\'+e.token+\'</code></div>\'});' +
+    'var tot=d.experts.length;var done=d.experts.filter(function(e){return e.status==="completed"}).length;' +
+    'pa.style.display="block";pa.innerHTML=\'<div style="margin-top:8px;padding-top:12px;border-top:1px solid #333"><div class="progress"><span>People: \'+tot+\'</span><span>Done: \'+done+\'</span></div></div>\';' +
+    'var hasAns=d.experts.some(function(e){return parseInt(e.answered||0)>0});sb.style.display=hasAns?"inline-flex":"none"}' +
+    'async function triggerSynth(){var b=document.getElementById("synthesize-btn");b.disabled=true;b.textContent="Synthesizing...";' +
+    'try{var r=await authFetch("/api/projects/"+PID+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json"}});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");' +
+    'var o=document.getElementById("synthesis-output");o.style.display="block";' +
+    'var bundleHtml="";if(d.bundle){var bkeys=Object.keys(d.bundle);' +
+    'bundleHtml=\'<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">\';' +
+    'bundleHtml+=\'<button class="btn btn-sm" onclick="downloadBundle()">Download OKF Bundle (.zip)</button>\';' +
+    'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'index.md\')">index.md</button>\';' +
+    'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'log.md\')">log.md</button>\';' +
+    'bkeys.forEach(function(f){if(f!==\'index.md\'&&f!==\'log.md\'){bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'\'+f+\'\')">\'+f+\'</button>\'}});' +
+    'bundleHtml+=\'</div>\';}' +
+    'o.innerHTML=\'<div class="card"><h3>Output</h3><pre id="md-out">\'+escHtml(d.markdown)+\'</pre><div style="margin-top:12px"><button class="btn btn-sm" onclick="copyMd()">Copy Markdown</button></div>\'+bundleHtml+\'</div>\';showToast("Synthesis complete!")}catch(e){showToast("Error: "+e.message)}' +
+    'b.disabled=false;b.textContent="Synthesize Now"}' +
+    'function copyMd(){var p=document.getElementById("md-out");navigator.clipboard.writeText(p.textContent).then(function(){showToast("Copied!")})}' +
+    'function downloadBundle(){' +
+    'authFetch("/api/projects/"+PID+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json"}}).then(function(r){return r.json()}).then(function(d){' +
+    'if(!d.bundle){showToast("No bundle data");return}' +
+    'var zip=new JSZip();var bkeys=Object.keys(d.bundle);' +
+    'for(var i=0;i<bkeys.length;i++){zip.file(bkeys[i],d.bundle[bkeys[i]])}' +
+    'zip.generateAsync({type:"blob"}).then(function(blob){' +
+    'var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="okf-bundle-"+PID+".zip";a.click();' +
+    'URL.revokeObjectURL(a.href);showToast("Bundle downloaded!")})})}' +
+    'function downloadFile(fn){' +
+    'authFetch("/api/projects/"+PID+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json"}}).then(function(r){return r.json()}).then(function(d){' +
+    'if(!d.bundle||!d.bundle[fn]){showToast("File not found");return}' +
+    'var blob=new Blob([d.bundle[fn]],{type:"text/markdown"});var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=fn;a.click();URL.revokeObjectURL(a.href)})}' +
+    'loadProject();'
+  ), {headers:{'Content-Type':'text/html'}});
+}
+
+// List user's projects (needs auth)
+async function listUserProjects(req, env) {
+  var uid = getUserId(req, env);
+  if (!uid) return json({error: 'Unauthorized', projects: []}, 401);
+  var projects = await sbQuery(env, 'chop_projects?user_id=eq.' + uid + '&select=*&order=created_at.desc');
+  if (!projects) projects = [];
+  return json({projects: projects});
 }
 
 async function answerPage(req, env, token) {
@@ -992,12 +1168,19 @@ export default {
     var method = request.method;
     if (method === 'OPTIONS') return new Response(null, {status:204, headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,PUT','Access-Control-Allow-Headers':'Content-Type,X-Owner-Token,Authorization'}});
 
-    // Auth
+    // Auth - keep existing auth API routes
     if (path === '/auth/signup' && method === 'POST') return handleSignup(request, env);
     if (path === '/auth/login' && method === 'POST') return handleLogin(request, env);
     if (path === '/auth/logout' && method === 'POST') return handleLogout(request, env);
     if (path === '/auth/me' && method === 'GET') return handleMe(request, env);
 
+    // Auth UI routes (before project routes so they match first)
+    if (path === '/login' && method === 'GET') return loginPage(request, env);
+    if (path === '/login/login' && method === 'POST') return loginPost(request, env);
+    if (path === '/login/signup' && method === 'POST') return signupPost(request, env);
+
+    // API - list user projects (needs auth)
+    if (path === '/api/projects' && method === 'GET') return listUserProjects(request, env);
     if (path === '/api/projects' && method === 'POST') return createProject(request, env);
     if (path === '/api/admin/events') return getEvents(request, env);
 
@@ -1018,6 +1201,9 @@ export default {
     if (m && method === 'POST') return submitAnswer(request, env, m[1]);
 
     if (path === '/admin') return adminPage(request, env);
+
+    m = path.match(/^\/project\/([^/]+)$/);
+    if (m) return projectDetailPage(request, env, m[1]);
 
     m = path.match(/^\/answer\/([^/]+)$/);
     if (m) return answerPage(request, env, m[1]);
