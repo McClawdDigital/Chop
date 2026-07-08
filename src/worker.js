@@ -316,50 +316,60 @@ async function loginPage(req, env) {
 }
 
 async function loginPost(req, env) {
-  var body = await req.json();
-  var r = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
-  if (!r.ok) {
-    var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Login failed';
-    return json({error: errMsg}, 401);
+  try {
+    var body = await req.json();
+    var r = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
+    if (!r.ok) {
+      var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Login failed';
+      return json({error: errMsg}, 401);
+    }
+    return json({user: r.data.user, access_token: r.data.access_token});
+  } catch(e) {
+    console.error('loginPost exception:', e.message, e.stack);
+    return json({error: 'Internal error: ' + e.message}, 500);
   }
-  return json({user: r.data.user, access_token: r.data.access_token});
 }
 
 async function signupPost(req, env) {
-  var body = await req.json();
-  var r = await sbAuth(env, 'signup', {email: body.email, password: body.password});
-  if (!r.ok) {
-    var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Signup failed';
-    return json({error: errMsg}, 400);
-  }
-  // Auto-confirm the user via direct SQL update (bypass email confirmation)
-  var userId = r.data && (r.data.id || (r.data.user && r.data.user.id));
-  if (userId) {
-    try {
-      // Call the auto_confirm_user stored procedure via postgREST
-      await fetch(env.SUPABASE_URL + '/rest/v1/rpc/auto_confirm_user', {
-        method: 'POST',
-        headers: {
-          'apikey': env.SUPABASE_SERVICE_KEY,
-          'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({user_id: userId})
-      });
-    } catch (e) {
-      console.error('signupPost: Auto-confirm failed', e.message);
+  try {
+    var body = await req.json();
+    var r = await sbAuth(env, 'signup', {email: body.email, password: body.password});
+    if (!r.ok) {
+      var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Signup failed';
+      return json({error: errMsg}, 400);
     }
+    // Auto-confirm the user via direct SQL update (bypass email confirmation)
+    var userId = r.data && (r.data.id || (r.data.user && r.data.user.id));
+    if (userId) {
+      try {
+        // Call the auto_confirm_user stored procedure via postgREST
+        await fetch(env.SUPABASE_URL + '/rest/v1/rpc/auto_confirm_user', {
+          method: 'POST',
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_KEY,
+            'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({user_id: userId})
+        });
+      } catch (e) {
+        console.error('signupPost: Auto-confirm failed', e.message);
+      }
+    }
+    // If auto-confirm is on, we get a session back
+    if (r.data && r.data.session && r.data.session.access_token) {
+      return json({user: r.data.user, access_token: r.data.session.access_token});
+    }
+    // Otherwise try logging in immediately (should work now that we confirmed)
+    var loginR = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
+    if (loginR.ok && loginR.data && loginR.data.access_token) {
+      return json({user: loginR.data.user, access_token: loginR.data.access_token});
+    }
+    return json({user: r.data.user, access_token: null});
+  } catch(e) {
+    console.error('signupPost exception:', e.message, e.stack);
+    return json({error: 'Internal error: ' + e.message}, 500);
   }
-  // If auto-confirm is on, we get a session back
-  if (r.data && r.data.session && r.data.session.access_token) {
-    return json({user: r.data.user, access_token: r.data.session.access_token});
-  }
-  // Otherwise try logging in immediately (should work now that we confirmed)
-  var loginR = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
-  if (loginR.ok && loginR.data && loginR.data.access_token) {
-    return json({user: loginR.data.user, access_token: loginR.data.access_token});
-  }
-  return json({user: r.data.user, access_token: null});
 }
 
 async function projectDetailPage(req, env, pid) {
@@ -1099,18 +1109,10 @@ async function sbQuery(env, path, opts) {
 }
 
 async function sbAuth(env, path, body) {
-  var method = body && body._method ? body._method : 'POST';
-  var headers = {'apikey': sbAnonKey(env), 'Content-Type': 'application/json'};
-  // If a user token is provided, pass it as Authorization
-  if (body && body._userToken) {
-    headers['Authorization'] = 'Bearer ' + body._userToken;
-    delete body._userToken;
-  }
-  if (body && body._method) delete body._method;
   var res = await fetch(env.SUPABASE_URL + '/auth/v1/' + path, {
-    method: method,
-    headers: headers,
-    body: method === 'GET' ? undefined : JSON.stringify(body)
+    method: 'POST',
+    headers: {'apikey': sbAnonKey(env), 'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
   });
   return {ok: res.ok, status: res.status, data: await res.json()};
 }
