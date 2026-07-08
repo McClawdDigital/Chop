@@ -1,10 +1,7 @@
 name = "chop-mvp"
 main = "src/worker.js"
-compatibility_date = "2025-07-01"
+compatibility_date = "2026-07-01"
 workers_dev = true
-
-[account]
-id = "942b0679cc154aa1a94b645b6564e3bd"
 
 [vars]
 SITE_NAME = "Chop"

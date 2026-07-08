@@ -31,46 +31,50 @@ async function generateQuestions(seed, env) {
     return DEFAULT_QUESTIONS;
   }
 
-  var systemPrompt = `You are a knowledge-capture question designer. Your job is to decompose a seed topic into its concrete components, then generate deeply specific questions anchored to the actual nouns in that seed.
+  var systemPrompt = `You are a knowledge-capture question designer. Your job is to decompose a seed topic into its concrete, named components and generate anchor-specific questions.
 
-## STRUCTURED SEED DECOMPOSITION (internal — do not output this analysis)
-First, extract the following from the seed topic:
+## AI-FIRST QUESTION DESIGN PRINCIPLES
 
-1. **ENTITIES** — Named systems, tools, platforms, frameworks, datasets, services, or products mentioned or implied
-2. **ROLES** — Specific job titles, teams, personas, stakeholders implied by the topic
-3. **PROCESSES** — Workflows, pipelines, step sequences, approval gates, or operational rhythms
-4. **TOOLS** — Specific software, CLIs, UIs, APIs, dashboards, configuration files, or infrastructure components
-5. **CONSTRAINTS** — Security boundaries, compliance requirements, SLAs, scale limitations, or organizational policies
-6. **GAPS** — What is NOT covered by the seed, what the reader might be confused about, what is commonly under-documented
+### Decomposition Phase (internal, do not output)
+Extract from the seed:
+1. **NAMED ENTITIES** — Specific systems, tools, platforms, frameworks, products, datasets (e.g. "Snowflake", "dbt Cloud", "Kubernetes EKS", "Datadog", "Stripe API", "GitHub Actions")
+2. **NAMED PEOPLE/ROLES** — Specific job titles, teams, or personas
+3. **NAMED PROCESSES** — Specific workflows, pipelines, step sequences, approval gates
+4. **SPECIFIC CONSTRAINTS** — Security boundaries, compliance requirements (e.g. "SOC 2 control A1.2", "PCI DSS"), SLAs, quotas
+5. **SPECIFIC GAPS** — What is NOT in the seed, what a new person would be confused about
 
-Then generate 10-12 questions that are DEEPLY SPECIFIC — every question must reference at least one specific named thing extracted above.
+### Question Generation Rules
+1. **Every question MUST reference at least 2 specific named things from the decomposition.** A question like "How do we deploy the React SPA to Cloudflare Pages?" is ANCHORED (references "React SPA" and "Cloudflare Pages"). A question like "What deployment process do you use?" is TOO GENERIC.
+2. **Pull from UNEXPECTED ANGLES** — Don't just ask the obvious questions. If the seed mentions "SOC 2 compliance and AWS", ask about "which AWS Config rules are enabled for SOC 2 evidence collection" rather than "how do you handle compliance."
+3. **Be deeply specific** — Questions should sound like they were written by someone who already knows the domain and wants to surface undocumented tribal knowledge.
+4. **Cover 4-6 categories** from: scope, persona, process, people, gap, failure, source. Don't force all 7.
+5. **Generate 10-12 questions total.**
+6. **Output ONLY a valid JSON array.** No markdown fences, no commentary.
+7. **Each object:** {"qid": "Q-CATEGORY-NN", "category": "scope|persona|process|people|gap|failure|source", "text": "question text"}
 
-## Question design rules
-- Every question MUST contain concrete, named references from the seed. Do NOT use generic question patterns with the seed topic simply inserted.
-- If the seed mentions "Kubernetes" and "Helm", ask about "Helm chart values" and "kubeconfig context", not just "what tools are used?"
-- If the seed mentions "SOC 2 compliance" and "AWS", ask about "AWS Config rules" or "evidence collection for SOC 2 control A1.2", not just "what are the compliance requirements?"
-- Questions should feel like they were written by someone who already understands the domain and wants to surface undocumented specifics.
-- Cover categories that naturally fit the seed (scope, persona, process, people, gap, failure, source). You are NOT required to cover all 7 — pick the 4-6 that are most relevant, but do generate 10-12 total questions. Distribute questions across the selected categories naturally.
-- Output ONLY a valid JSON array. No markdown fences, no commentary, no explanation.
-- Each object: {"qid": "Q-CATEGORY-NN", "category": "scope|persona|process|people|gap|failure|source", "text": "the question text"}
+### Strong Examples vs Weak Examples
 
-## Examples of anchored vs template questions
+SEED: "Document how we deploy our React SPA frontend to Cloudflare Pages using GitHub Actions"
+STRONG: "Which specific Cloudflare Pages project name and account ID are used for production, and what GitHub Actions workflow file (.github/workflows/deploy.yml) triggers the build?"
+WEAK: "What tools are used for deployment?"
 
-Seed: "Document how we deploy our React SPA frontend to Cloudflare Pages using GitHub Actions"
-ANCHORED (GOOD): "Which specific Cloudflare Pages project name and account ID are used for production, and what GitHub Actions workflow file (.github/workflows/deploy.yml) triggers the build — what are the exact branch triggers and environment secrets required?"
-GENERIC (BAD): "What tools are used in the deployment process?"
+SEED: "Capture the onboarding steps for a data engineer joining the analytics team, including Snowflake, dbt, Airflow, and Looker access"
+STRONG: "Which Snowflake role (TRANSFORMER or ANALYST) is assigned to new data engineers, and who in the analytics team currently manages dbt Cloud project permissions?"
+WEAK: "What tools does a new data engineer need?"
 
-Seed: "Capture the onboarding steps for a data engineer joining the analytics team, including Snowflake, dbt, Airflow, and Looker access"
-ANCHORED (GOOD): "Which Snowflake role (e.g., TRANSFORMER, ANALYST) is assigned to new data engineers, and who in the analytics team currently manages Snowflake warehouse grants and dbt Cloud project permissions?"
-GENERIC (BAD): "What tools does a new data engineer need?"
-
-Seed: "Document the incident response process for production outages in our Kubernetes cluster (EKS, Istio, Datadog)"
-ANCHORED (GOOD): "When Datadog triggers a P1 alert for high error rate on the 'checkout-service' pod, what is the exact sequence of commands (kubectl, istioctl, etc.) the on-call engineer runs to diagnose and mitigate — and which Slack channel receives the alert notification?"
-GENERIC (BAD): "What happens during an incident?"`;
+SEED: "Document the incident response process for production outages in our Kubernetes cluster (EKS, Istio, Datadog)"
+STRONG: "When Datadog triggers a P1 alert for high error rate on the 'checkout-service' pod, what is the exact sequence of kubectl and istioctl commands the on-call engineer runs to diagnose and mitigate?"
+WEAK: "What happens during an incident?"`;
 
   var userPrompt = `Seed topic: "${seed}"
 
-Decompose this seed topic into its specific entities, tools, roles, processes, constraints, and gaps. Then generate 10-12 deeply specific questions for a knowledge capture questionnaire. Every question must reference concrete, named things from the seed — not generic templates with the topic inserted. Output ONLY the JSON array, no other text.`;
+## Decomposition
+Extract the named entities, tools, roles, processes, constraints, and gaps from this seed. List them explicitly.
+
+## Questions
+Now generate 10-12 deeply specific, anchor-heavy questions. Every question MUST name at least 2 specific things from the decomposition. Avoid generic templates — each question should feel like it was crafted by someone who already knows this domain and wants to surface undocumented specifics.
+
+Output ONLY a valid JSON array. No markdown fences, no commentary, no explanation.`;
 
   try {
     var response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -212,8 +216,10 @@ async function homePage(req, env) {
   if (token) {
     var uid = jwtUserId(token);
     if (uid) {
-      var r = await sbAuth(env, 'user', {});
-      if (r.ok) user = {id: uid, email: r.data && r.data.email};
+      try {
+        var r = await sbUser(token, env);
+        if (r.ok) { var userData = await r.json(); user = {id: uid, email: userData && userData.email}; }
+      } catch(e) { console.error('homePage: sbUser failed', e.message); }
     }
   }
 
@@ -298,12 +304,12 @@ async function loginPage(req, env) {
     'async function doLogin(){var e=document.getElementById("login-email").value.trim();var p=document.getElementById("login-password").value;if(!e||!p){showToast("Enter email and password");return}' +
     'try{var r=await fetch("/login/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:e,password:p})});var d=await r.json();' +
     'if(!r.ok){var er=document.getElementById("login-error");er.textContent=d.error||"Login failed";er.style.display="block";return}' +
-    'sessionStorage.setItem("chop_token",d.access_token);document.getElementById("login-form").style.display="none";document.getElementById("login-success").style.display="block";' +
+    'sessionStorage.setItem("chop_token",d.access_token);document.cookie="chop_token="+d.access_token+"; path=/; max-age=86400; SameSite=Lax";document.getElementById("login-form").style.display="none";document.getElementById("login-success").style.display="block";' +
     'setTimeout(function(){window.location.href="/"},1000)}catch(e){showToast("Error: "+e.message)}}' +
     'async function doSignup(){var e=document.getElementById("login-email").value.trim();var p=document.getElementById("login-password").value;if(!e||!p){showToast("Enter email and password");return}' +
     'try{var r=await fetch("/login/signup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:e,password:p})});var d=await r.json();' +
     'if(!r.ok){var er=document.getElementById("login-error");er.textContent=d.error||"Signup failed";er.style.display="block";return}' +
-    'if(d.access_token){sessionStorage.setItem("chop_token",d.access_token)}' +
+    'if(d.access_token){sessionStorage.setItem("chop_token",d.access_token);document.cookie="chop_token="+d.access_token+"; path=/; max-age=86400; SameSite=Lax"}' +
     'document.getElementById("login-form").style.display="none";document.getElementById("login-success").style.display="block";' +
     'setTimeout(function(){window.location.href="/"},1000)}catch(e){showToast("Error: "+e.message)}}'
   ), {headers:{'Content-Type':'text/html'}});
@@ -326,11 +332,29 @@ async function signupPost(req, env) {
     var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Signup failed';
     return json({error: errMsg}, 400);
   }
+  // Auto-confirm the user via direct SQL update (bypass email confirmation)
+  var userId = r.data && (r.data.id || (r.data.user && r.data.user.id));
+  if (userId) {
+    try {
+      // Call the auto_confirm_user stored procedure via postgREST
+      await fetch(env.SUPABASE_URL + '/rest/v1/rpc/auto_confirm_user', {
+        method: 'POST',
+        headers: {
+          'apikey': env.SUPABASE_SERVICE_KEY,
+          'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({user_id: userId})
+      });
+    } catch (e) {
+      console.error('signupPost: Auto-confirm failed', e.message);
+    }
+  }
   // If auto-confirm is on, we get a session back
   if (r.data && r.data.session && r.data.session.access_token) {
     return json({user: r.data.user, access_token: r.data.session.access_token});
   }
-  // Otherwise try logging in immediately
+  // Otherwise try logging in immediately (should work now that we confirmed)
   var loginR = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
   if (loginR.ok && loginR.data && loginR.data.access_token) {
     return json({user: loginR.data.user, access_token: loginR.data.access_token});
@@ -344,8 +368,10 @@ async function projectDetailPage(req, env, pid) {
   if (token) {
     var uid = jwtUserId(token);
     if (uid) {
-      var r = await sbAuth(env, 'user', {});
-      if (r.ok) user = {id: uid, email: r.data && r.data.email};
+      try {
+        var r = await sbUser(token, env);
+        if (r.ok) { var userData = await r.json(); user = {id: uid, email: userData && userData.email}; }
+      } catch(e) { console.error('projectDetailPage: sbUser failed', e.message); }
     }
   }
   if (!user) {
@@ -424,7 +450,8 @@ async function projectDetailPage(req, env, pid) {
 async function listUserProjects(req, env) {
   var uid = getUserId(req, env);
   if (!uid) return json({error: 'Unauthorized', projects: []}, 401);
-  var projects = await sbQuery(env, 'chop_projects?user_id=eq.' + uid + '&select=*&order=created_at.desc');
+  var ut = getUserToken(req);
+  var projects = await sbQuery(env, 'chop_projects?user_id=eq.' + uid + '&select=*&order=created_at.desc', {userToken: ut});
   if (!projects) projects = [];
   return json({projects: projects});
 }
@@ -524,9 +551,13 @@ async function createProject(req, env) {
   if (!body.seed || body.seed.length < 5) return json({error:'Seed too short'}, 400);
   var questions = await generateQuestions(body.seed, env);
   var name = body.seed.split('.')[0].slice(0,40).trim() || 'Untitled';
+  var uid = getUserId(req, env);
+  var ut = getUserToken(req);
+  if (!uid) return json({error:'Authentication required'}, 401);
   var result = await sbQuery(env, 'chop_projects', {
     method: 'POST',
-    body: {name: name, seed: body.seed, questions: questions, status: 'questions_generated', user_id: '00000000-0000-0000-0000-000000000000'}
+    userToken: ut,
+    body: {name: name, seed: body.seed, questions: questions, status: 'questions_generated', user_id: uid}
   });
   var project = result && result[0];
   if (!project) return json({error:'Failed to create project'}, 500);
@@ -541,8 +572,10 @@ async function addExpert(req, env, pid) {
   var body = await req.json();
   if (!body.name) return json({error:'Name required'}, 400);
   var et = t(8);
+  var ut = getUserToken(req);
   var result = await sbQuery(env, 'chop_experts', {
     method: 'POST',
+    userToken: ut,
     body: {project_id: pid, name: body.name, email: body.email||'', token: et, status:'pending', answered:0, total_questions: (p.questions||DEFAULT_QUESTIONS).length}
   });
   var expert = result && result[0];
@@ -563,9 +596,9 @@ async function getProject(req, env, pid) {
   var experts = await sbQuery(env, 'chop_experts?project_id=eq.' + pid + '&select=*');
   if (!experts) experts = [];
   return json({...p, experts});
-}
+  }
 
-async function expertQuestions(req, env, token) {
+  async function expertQuestions(req, env, token) {
   var experts = await sbQuery(env, 'chop_experts?token=eq.' + token + '&select=*');
   var expert = experts && experts[0];
   if (!expert) return json({error:'Not found'}, 404);
@@ -725,9 +758,11 @@ async function synthesize(req, env, pid) {
     answerBlocks += '\n';
   }
 
-  var systemPrompt = 'You are an expert knowledge synthesizer. Given raw expert interview answers about a topic, your job is to produce a coherent, structured knowledge document.';
+  var systemPrompt = 'You are an expert knowledge synthesizer. Given raw expert interview answers about a topic, produce a coherent, structured knowledge document.';
   systemPrompt += ' Identify consensus statements, flag divergences or disagreements, highlight uncertainty, and extract actionable takeaways.';
   systemPrompt += ' Output valid markdown. Be thorough but concise.';
+  systemPrompt += ' CRITICAL: Do NOT simply repeat the raw answers. Synthesize them. Group related ideas, identify patterns, and flag contradictions.';
+  systemPrompt += ' Use headers, bullet points, and **bold** for emphasis. Do NOT wrap in code fences.';
 
   var userPrompt = 'Synthesize the following expert answers into a structured knowledge document.\n\n';
   userPrompt += 'Project: ' + p.name + '\n';
@@ -735,11 +770,11 @@ async function synthesize(req, env, pid) {
   userPrompt += '## Expert Answers\n\n';
   userPrompt += answerBlocks;
   userPrompt += '\n\nProduce a markdown document with the following sections:\n';
-  userPrompt += '1. **Executive Summary** — 2-3 paragraph synthesis of the key takeaways from all answers.\n';
-  userPrompt += '2. **Key Insights by Category** — For each category that has answers, provide: consensus statements (what experts agreed on), divergence notes (where they disagreed or offered different perspectives), and uncertainty flags (areas lacking data).\n';
-  userPrompt += '3. **Actionable Takeaways** — Concrete next steps, decisions, or actions implied by the knowledge.\n';
-  userPrompt += '4. **Gaps & Recommended Follow-ups** — What is missing or needs further investigation.\n\n';
-  userPrompt += 'Format: clean markdown. Use headings, bullet points, and **bold** for emphasis. Do NOT wrap in code fences.';
+  userPrompt += '1. **Executive Summary** — 2-3 paragraph synthesis of the key takeaways from all answers. What would someone need to know after reading this?.\n';
+  userPrompt += '2. **Key Insights by Category** — For each category that has answers, provide: (a) consensus statements (what experts agreed on), (b) divergence notes (where they disagreed or offered different perspectives), and (c) uncertainty flags (areas lacking data). Group related answers, don\'t just list them.\n';
+  userPrompt += '3. **Actionable Takeaways** — Concrete next steps, decisions, or actions implied by the knowledge. Who should do what?.\n';
+  userPrompt += '4. **Gaps & Recommended Follow-ups** — What is missing or needs further investigation, and who might know the answers.\n\n';
+  userPrompt += 'Format: clean markdown with headers. Be analytical — don\'t just summarize, actually synthesize. Flag specific expert names when they hold unique knowledge. Do NOT wrap the entire output in a code fence.';
 
   // ---- Call OpenRouter for AI synthesis ----
   var apiKey = await fetchOpenRouterKey(env);
@@ -1042,9 +1077,10 @@ function sbAnonKey(env) { return env.SUPABASE_ANON_KEY; }
 
 async function sbQuery(env, path, opts) {
   var url = env.SUPABASE_URL + '/rest/v1/' + path;
+  var bearerKey = (opts && opts.userToken) || sbKey(env);
   var headers = {
     'apikey': sbKey(env),
-    'Authorization': 'Bearer ' + sbKey(env),
+    'Authorization': 'Bearer ' + bearerKey,
     'Content-Type': 'application/json',
     'Prefer': opts && opts.prefer ? opts.prefer : 'return=representation'
   };
@@ -1063,12 +1099,31 @@ async function sbQuery(env, path, opts) {
 }
 
 async function sbAuth(env, path, body) {
+  var method = body && body._method ? body._method : 'POST';
+  var headers = {'apikey': sbAnonKey(env), 'Content-Type': 'application/json'};
+  // If a user token is provided, pass it as Authorization
+  if (body && body._userToken) {
+    headers['Authorization'] = 'Bearer ' + body._userToken;
+    delete body._userToken;
+  }
+  if (body && body._method) delete body._method;
   var res = await fetch(env.SUPABASE_URL + '/auth/v1/' + path, {
-    method: 'POST',
-    headers: {'apikey': sbAnonKey(env), 'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
+    method: method,
+    headers: headers,
+    body: method === 'GET' ? undefined : JSON.stringify(body)
   });
   return {ok: res.ok, status: res.status, data: await res.json()};
+}
+
+function sbUser(token, env) {
+  // GET /auth/v1/user with the user's JWT
+  return fetch(env.SUPABASE_URL + '/auth/v1/user', {
+    method: 'GET',
+    headers: {
+      'apikey': sbAnonKey(env),
+      'Authorization': 'Bearer ' + token
+    }
+  });
 }
 
 function jwtUserId(token) {
@@ -1115,14 +1170,23 @@ async function handleMe(req, env) {
   if (!token) return json({user: null});
   var uid = jwtUserId(token);
   if (!uid) return json({user: null});
-  var r = await sbAuth(env, 'user', {});
-  if (!r.ok) return json({user: null});
-  return json({user: {id: uid, email: r.data && r.data.email}});
+  try {
+    var r = await sbUser(token, env);
+    if (!r.ok) return json({user: null});
+    var userData = await r.json();
+    return json({user: {id: uid, email: userData && userData.email}});
+  } catch(e) { return json({user: null}); }
 }
 
 function getUserId(req, env) {
   var token = getAuthToken(req);
   return token ? jwtUserId(token) : null;
+}
+
+function getUserToken(req) {
+  var auth = req.headers.get('Authorization');
+  if (auth && auth.startsWith('Bearer ')) return auth.slice(7);
+  return null;
 }
 
 // Fetches the OpenRouter API key from Supabase chop_config table
