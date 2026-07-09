@@ -1,146 +1,11 @@
-// Chop MVP -- one Worker, in-memory store (no KV), no build step
-// When the flow is validated, this entire codebase is disposable.
-// Data lives in memory -- survives warm Workers, lost on cold start.
-// That's fine for a playtest with a few people for a few hours.
+// Chop MVP -- one Worker, serves frontend + proxies REST + fires Edge Functions
+// All AI work runs in Supabase Edge Functions (no 30s Worker CPU limit).
+// Data lives in Supabase (chop_projects, chop_experts, chop_answers).
 
 const B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 function t(n) { let s='';for(let i=n||8;i>0;i--)s+=B62[Math.random()*62|0];return s; }
 
-// Static fallback questions -- used when AI generation fails
-const DEFAULT_QUESTIONS = [
-  {qid:'Q-SCOPE-01',category:'scope',text:'What specific systems, tools, or processes does this topic cover?'},
-  {qid:'Q-SCOPE-02',category:'scope',text:'What is explicitly OUT of scope for this knowledge base?'},
-  {qid:'Q-PERSONA-01',category:'persona',text:'Who needs this knowledge most? What do new people need to know?'},
-  {qid:'Q-PROCESS-01',category:'process',text:'How does the core process work today? Walk through it step by step.'},
-  {qid:'Q-PROCESS-02',category:'process',text:'What tools or permissions are needed to do this work?'},
-  {qid:'Q-PEOPLE-01',category:'people',text:'Who are the key people involved? Who owns each part?'},
-  {qid:'Q-GAP-01',category:'gap',text:'What is currently undocumented or poorly understood about this topic?'},
-  {qid:'Q-FAILURE-01',category:'failure',text:'What are the most common mistakes or failure points?'},
-  {qid:'Q-SOURCE-01',category:'source',text:'Where does the authoritative truth live? (docs, dashboards, people)'},
-  {qid:'Q-PERSONA-02',category:'persona',text:'If someone new joined tomorrow, what would they be confused about?'},
-];
-
-// AI-powered question generation -- adaptive, seed-decomposing
-// Calls OpenRouter to analyze the seed and produce specific questions
-// Reads API key from Supabase chop_config table so deploys don't need re-secret-ing
-async function generateQuestions(seed, env) {
-  // Fetch API key from Supabase config
-  var apiKey = await fetchOpenRouterKey(env);
-  if (!apiKey) {
-    console.error('generateQuestions: Could not retrieve OPENROUTER_API_KEY from Supabase, falling back to defaults');
-    return DEFAULT_QUESTIONS;
-  }
-
-  var systemPrompt = `You are a knowledge-capture question designer. Your job is to decompose a seed topic into its concrete, named components and generate anchor-specific questions.
-
-## AI-FIRST QUESTION DESIGN PRINCIPLES
-
-### Decomposition Phase (internal, do not output)
-Extract from the seed:
-1. **NAMED ENTITIES** — Specific systems, tools, platforms, frameworks, products, datasets (e.g. "Snowflake", "dbt Cloud", "Kubernetes EKS", "Datadog", "Stripe API", "GitHub Actions")
-2. **NAMED PEOPLE/ROLES** — Specific job titles, teams, or personas
-3. **NAMED PROCESSES** — Specific workflows, pipelines, step sequences, approval gates
-4. **SPECIFIC CONSTRAINTS** — Security boundaries, compliance requirements (e.g. "SOC 2 control A1.2", "PCI DSS"), SLAs, quotas
-5. **SPECIFIC GAPS** — What is NOT in the seed, what a new person would be confused about
-
-### Question Generation Rules
-1. **Every question MUST reference at least 2 specific named things from the decomposition.** A question like "How do we deploy the React SPA to Cloudflare Pages?" is ANCHORED (references "React SPA" and "Cloudflare Pages"). A question like "What deployment process do you use?" is TOO GENERIC.
-2. **Pull from UNEXPECTED ANGLES** — Don't just ask the obvious questions. If the seed mentions "SOC 2 compliance and AWS", ask about "which AWS Config rules are enabled for SOC 2 evidence collection" rather than "how do you handle compliance."
-3. **Be deeply specific** — Questions should sound like they were written by someone who already knows the domain and wants to surface undocumented tribal knowledge.
-4. **Cover 4-6 categories** from: scope, persona, process, people, gap, failure, source. Don't force all 7.
-5. **Generate 10-12 questions total.**
-6. **Output ONLY a valid JSON array.** No markdown fences, no commentary.
-7. **Each object:** {"qid": "Q-CATEGORY-NN", "category": "scope|persona|process|people|gap|failure|source", "text": "question text"}
-
-### Strong Examples vs Weak Examples
-
-SEED: "Document how we deploy our React SPA frontend to Cloudflare Pages using GitHub Actions"
-STRONG: "Which specific Cloudflare Pages project name and account ID are used for production, and what GitHub Actions workflow file (.github/workflows/deploy.yml) triggers the build?"
-WEAK: "What tools are used for deployment?"
-
-SEED: "Capture the onboarding steps for a data engineer joining the analytics team, including Snowflake, dbt, Airflow, and Looker access"
-STRONG: "Which Snowflake role (TRANSFORMER or ANALYST) is assigned to new data engineers, and who in the analytics team currently manages dbt Cloud project permissions?"
-WEAK: "What tools does a new data engineer need?"
-
-SEED: "Document the incident response process for production outages in our Kubernetes cluster (EKS, Istio, Datadog)"
-STRONG: "When Datadog triggers a P1 alert for high error rate on the 'checkout-service' pod, what is the exact sequence of kubectl and istioctl commands the on-call engineer runs to diagnose and mitigate?"
-WEAK: "What happens during an incident?"`;
-
-  var userPrompt = `Seed topic: "${seed}"
-
-## Decomposition
-Extract the named entities, tools, roles, processes, constraints, and gaps from this seed. List them explicitly.
-
-## Questions
-Now generate 10-12 deeply specific, anchor-heavy questions. Every question MUST name at least 2 specific things from the decomposition. Avoid generic templates — each question should feel like it was crafted by someone who already knows this domain and wants to surface undocumented specifics.
-
-Output ONLY a valid JSON array. No markdown fences, no commentary, no explanation.`;
-
-  try {
-    var response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + apiKey,
-        'HTTP-Referer': 'https://chop-mvp.nousresearch.com',
-        'X-Title': 'Chop MVP'
-      },
-      body: JSON.stringify({
-        model: 'openai/gpt-4o',
-        messages: [
-          {role: 'system', content: systemPrompt},
-          {role: 'user', content: userPrompt}
-        ],
-        temperature: 0.7,
-        max_tokens: 2000
-      })
-    });
-
-    if (!response.ok) {
-      console.error('generateQuestions: API returned ' + response.status, await response.text());
-      return DEFAULT_QUESTIONS;
-    }
-
-    var data = await response.json();
-    var content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (!content) {
-      console.error('generateQuestions: No content in response', JSON.stringify(data));
-      return DEFAULT_QUESTIONS;
-    }
-
-    // Strip any markdown code fences the model might add
-    content = content.trim();
-    if (content.startsWith('```json')) content = content.slice(7);
-    else if (content.startsWith('```')) content = content.slice(3);
-    if (content.endsWith('```')) content = content.slice(0, -3);
-    content = content.trim();
-
-    var questions = JSON.parse(content);
-
-    // Validate structure
-    if (!Array.isArray(questions) || questions.length < 8 || questions.length > 12) {
-      console.error('generateQuestions: Invalid question count or not an array', questions.length);
-      return DEFAULT_QUESTIONS;
-    }
-
-    for (var i = 0; i < questions.length; i++) {
-      var q = questions[i];
-      if (!q.qid || !q.category || !q.text ||
-          ['scope','persona','process','people','gap','failure','source'].indexOf(q.category) === -1) {
-        console.error('generateQuestions: Invalid question at index ' + i, JSON.stringify(q));
-        return DEFAULT_QUESTIONS;
-      }
-    }
-
-    return questions;
-
-  } catch (e) {
-    console.error('generateQuestions: Exception', e.message);
-    return DEFAULT_QUESTIONS;
-  }
-}
-
-// HTML shell -- string concatenation, no template literals
+// HTML shell
 const CSS = '*{box-sizing:border-box;margin:0;padding:0}'+
 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f0f0f;color:#e0e0e0}'+
 '.container{max-width:720px;margin:0 auto;padding:24px 16px}'+
@@ -186,7 +51,6 @@ function shell(body, title, extra) {
   return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+(title||'Chop')+'</title><style>'+CSS+'</style></head><body><div class="container">'+body+'</div><div id="toast" class="toast"></div><script>function showToast(msg,d){var t=document.getElementById("toast");t.textContent=msg;t.classList.add("show");setTimeout(function(){t.classList.remove("show")},d||3000)}'+(extra||'')+'</script></body></html>';
 }
 
-// Auth UI helpers
 function authScript() {
   return 'var tok=sessionStorage.getItem("chop_token");' +
     'async function authFetch(u,o){if(!o)o={};o.headers=o.headers||{};if(tok)o.headers["Authorization"]="Bearer "+tok;return fetch(u,o)}' +
@@ -226,7 +90,6 @@ async function homePage(req, env) {
   var body = '';
 
   if (user && user.email) {
-    // Logged in: show project dashboard
     body += navBar(user);
     body += '<div class="flex-between"><h1>Your Projects</h1></div>';
     body += '<div id="dashboard-area"></div>';
@@ -247,7 +110,7 @@ async function homePage(req, env) {
       'if(projects.length===0){da.innerHTML+=\'<div class="card" style="text-align:center;padding:40px 0"><div style="color:#666;font-size:1rem">No projects yet.</div><div style="color:#555;font-size:0.85rem;margin-top:8px">Create your first project to capture knowledge.</div></div>\';return}' +
       'da.innerHTML+=projects.map(function(p){' +
       'var qc=p.questions?p.questions.length:0;' +
-      'return\'<div class="card project-card" style="cursor:pointer" onclick="window.location.href=\\\'/project/\'+p.id+\'\\\'">\' +' +
+      'return\'<div class="card project-card" style="cursor:pointer" onclick="window.location.href=\\\\\'/project/\'+p.id+\'\\\\\'">\' +' +
       '\'<div class="flex-between"><div><strong>\'+escHtml(p.name||"Untitled")+\'</strong><span class="tag" style="margin-left:8px">\'+escHtml(p.status||"draft")+\'</span></div>\' +' +
       '\'<span style="color:#666;font-size:0.8rem">\'+(p.created_at||"").slice(0,10)+\'</span></div>\' +' +
       '\'<div style="font-size:0.85rem;color:#888;margin-top:4px">\'+escHtml((p.seed||"").slice(0,100))+\'</div>\' +' +
@@ -256,14 +119,12 @@ async function homePage(req, env) {
       '}' +
       'function showNewProject(){document.getElementById("new-project-card").style.display="block";document.getElementById("new-project-btn").style.display="none"}' +
       'async function startProject(){var s=document.getElementById("seed").value.trim();if(!s){showToast("Enter a topic first");return}' +
-      'var b=document.querySelector("#new-project-card .btn");b.disabled=true;b.textContent="Generating...";' +
-      'try{var r=await authFetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seed:s})});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");' +
-      'window.location.href="/project/"+d.id}catch(e){showToast("Error: "+e.message)}' +
-      'b.disabled=false;b.textContent="Generate Questions"}' +
+            'var b=document.querySelector("#new-project-card .btn");b.disabled=true;b.textContent="Generating...";document.getElementById("status-msg").textContent="Please wait...";' +
+            'try{var r=await authFetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seed:s})});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");window.location.href="/project/"+d.id}catch(e){document.getElementById("status-msg").textContent="Error: "+e.message+". Try again or use a simpler seed.";showToast("Error: "+e.message)}' +
+            'b.disabled=false;b.textContent="Generate Questions"}' +
       'loadDashboard();';
     return new Response(shell(body, 'Chop - Dashboard', extra), {headers:{'Content-Type':'text/html'}});
   } else {
-    // Not logged in: show landing with login prompt
     body += navBar(null);
     body += '<div style="text-align:center;padding:40px 0">';
     body += '<div class="logo" style="font-size:3rem;margin-bottom:16px">\u{1FA97}</div>';
@@ -338,11 +199,9 @@ async function signupPost(req, env) {
       var errMsg = (r.data && (r.data.msg || r.data.error_description)) || 'Signup failed';
       return json({error: errMsg}, 400);
     }
-    // Auto-confirm the user via direct SQL update (bypass email confirmation)
     var userId = r.data && (r.data.id || (r.data.user && r.data.user.id));
     if (userId) {
       try {
-        // Call the auto_confirm_user stored procedure via postgREST
         await fetch(env.SUPABASE_URL + '/rest/v1/rpc/auto_confirm_user', {
           method: 'POST',
           headers: {
@@ -356,11 +215,9 @@ async function signupPost(req, env) {
         console.error('signupPost: Auto-confirm failed', e.message);
       }
     }
-    // If auto-confirm is on, we get a session back
     if (r.data && r.data.session && r.data.session.access_token) {
       return json({user: r.data.user, access_token: r.data.session.access_token});
     }
-    // Otherwise try logging in immediately (should work now that we confirmed)
     var loginR = await sbAuth(env, 'token?grant_type=password', {email: body.email, password: body.password});
     if (loginR.ok && loginR.data && loginR.data.access_token) {
       return json({user: loginR.data.user, access_token: loginR.data.access_token});
@@ -401,10 +258,18 @@ async function projectDetailPage(req, env, pid) {
     'Chop - Project',
     authScript() +
     'var PID="'+pid+'";' +
+    'var POLL_INTERVAL=null;' +
     'async function loadProject(){' +
     'try{var r=await authFetch("/api/projects/"+PID);var p=await r.json();if(!r.ok)throw new Error(p.error||"Not found");renderProject(p)}catch(e){' +
     'document.getElementById("project-loading").textContent="Error: "+e.message}}' +
     'function renderProject(p){' +
+    'if(p.status==="generating"){' +
+    'document.getElementById("project-area").innerHTML=\'<div class="card" style="text-align:center;padding:40px 0"><div style="font-size:2rem;margin-bottom:12px">&#9203;</div><h2>Generating questions...</h2><p style="color:#888;margin-top:8px">AI is analyzing your seed topic and crafting targeted questions. This usually takes 5-15 seconds.</p></div>\';' +
+    'if(!POLL_INTERVAL){POLL_INTERVAL=setInterval(function(){loadProject()},3000)};return}' +
+    'if(p.status==="synthesizing"){' +
+    'document.getElementById("project-area").innerHTML=\'<div class="card" style="text-align:center;padding:40px 0"><div style="font-size:2rem;margin-bottom:12px">&#9203;</div><h2>Synthesizing answers...</h2><p style="color:#888;margin-top:8px">AI is analyzing expert answers and producing a knowledge document. This usually takes 10-30 seconds.</p></div>\';' +
+    'if(!POLL_INTERVAL){POLL_INTERVAL=setInterval(function(){loadProject()},3000)};return}' +
+    'if(POLL_INTERVAL){clearInterval(POLL_INTERVAL);POLL_INTERVAL=null}' +
     'var a=document.getElementById("project-area");' +
     'var qh="";for(var i=0;i<p.questions.length;i++){var q=p.questions[i];' +
     'qh+=\'<div style="padding:8px 0;border-bottom:1px solid #2a2a2a;display:flex;align-items:flex-start;gap:8px"><input type="checkbox" checked id="q-\'+i+\'" style="width:auto;margin-top:4px">\'' +
@@ -427,21 +292,32 @@ async function projectDetailPage(req, env, pid) {
     'var tot=d.experts.length;var done=d.experts.filter(function(e){return e.status==="completed"}).length;' +
     'pa.style.display="block";pa.innerHTML=\'<div style="margin-top:8px;padding-top:12px;border-top:1px solid #333"><div class="progress"><span>People: \'+tot+\'</span><span>Done: \'+done+\'</span></div></div>\';' +
     'var hasAns=d.experts.some(function(e){return parseInt(e.answered||0)>0});sb.style.display=hasAns?"inline-flex":"none"}' +
-    'async function triggerSynth(){var b=document.getElementById("synthesize-btn");b.disabled=true;b.textContent="Synthesizing...";' +
+    'async function triggerSynth(){var b=document.getElementById("synthesize-btn");b.disabled=true;b.textContent="Starting...";' +
     'try{var r=await authFetch("/api/projects/"+PID+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json"}});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");' +
+    'if(d.status==="ok"){' +
+    'b.textContent="Synthesizing in background...";' +
+    'if(!POLL_INTERVAL){POLL_INTERVAL=setInterval(function(){checkSynthesis()},3000)};' +
+    'loadProject()}' +
+    '}catch(e){showToast("Error: "+e.message)}b.disabled=false}' +
+    'async function checkSynthesis(){' +
+    'try{var r=await authFetch("/api/projects/"+PID);var p=await r.json();if(!r.ok)return;' +
+    'if(p.status==="synthesized"&&p.synthesis_result){' +
+    'if(POLL_INTERVAL){clearInterval(POLL_INTERVAL);POLL_INTERVAL=null}' +
+    'renderSynthesis(p.synthesis_result)}' +
+    '}catch(e){}}' +
+    'function renderSynthesis(sr){' +
     'var o=document.getElementById("synthesis-output");o.style.display="block";' +
-    'var bundleHtml="";if(d.bundle){var bkeys=Object.keys(d.bundle);' +
+    'var bundleHtml="";if(sr.bundle){var bkeys=Object.keys(sr.bundle);' +
     'bundleHtml=\'<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">\';' +
     'bundleHtml+=\'<button class="btn btn-sm" onclick="downloadBundle()">Download OKF Bundle (.zip)</button>\';' +
     'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'index.md\')">index.md</button>\';' +
     'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'log.md\')">log.md</button>\';' +
     'bkeys.forEach(function(f){if(f!==\'index.md\'&&f!==\'log.md\'){bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'\'+f+\'\')">\'+f+\'</button>\'}});' +
     'bundleHtml+=\'</div>\';}' +
-    'o.innerHTML=\'<div class="card"><h3>Output</h3><pre id="md-out">\'+escHtml(d.markdown)+\'</pre><div style="margin-top:12px"><button class="btn btn-sm" onclick="copyMd()">Copy Markdown</button></div>\'+bundleHtml+\'</div>\';showToast("Synthesis complete!")}catch(e){showToast("Error: "+e.message)}' +
-    'b.disabled=false;b.textContent="Synthesize Now"}' +
+    'o.innerHTML=\'<div class="card"><h3>Output</h3><pre id="md-out">\'+escHtml(sr.markdown)+\'</pre><div style="margin-top:12px"><button class="btn btn-sm" onclick="copyMd()">Copy Markdown</button></div>\'+bundleHtml+\'</div>\';showToast("Synthesis complete!")}' +
     'function copyMd(){var p=document.getElementById("md-out");navigator.clipboard.writeText(p.textContent).then(function(){showToast("Copied!")})}' +
     'function downloadBundle(){' +
-    'authFetch("/api/projects/"+PID+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json"}}).then(function(r){return r.json()}).then(function(d){' +
+    'authFetch("/api/projects/"+PID+"/synthesize/download").then(function(r){return r.json()}).then(function(d){' +
     'if(!d.bundle){showToast("No bundle data");return}' +
     'var zip=new JSZip();var bkeys=Object.keys(d.bundle);' +
     'for(var i=0;i<bkeys.length;i++){zip.file(bkeys[i],d.bundle[bkeys[i]])}' +
@@ -449,14 +325,14 @@ async function projectDetailPage(req, env, pid) {
     'var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="okf-bundle-"+PID+".zip";a.click();' +
     'URL.revokeObjectURL(a.href);showToast("Bundle downloaded!")})})}' +
     'function downloadFile(fn){' +
-    'authFetch("/api/projects/"+PID+"/synthesize",{method:"POST",headers:{"Content-Type":"application/json"}}).then(function(r){return r.json()}).then(function(d){' +
+    'authFetch("/api/projects/"+PID+"/synthesize/download").then(function(r){return r.json()}).then(function(d){' +
     'if(!d.bundle||!d.bundle[fn]){showToast("File not found");return}' +
     'var blob=new Blob([d.bundle[fn]],{type:"text/markdown"});var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=fn;a.click();URL.revokeObjectURL(a.href)})}' +
     'loadProject();'
   ), {headers:{'Content-Type':'text/html'}});
 }
 
-// List user's projects (needs auth)
+// List user's projects
 async function listUserProjects(req, env) {
   var uid = getUserId(req, env);
   if (!uid) return json({error: 'Unauthorized', projects: []}, 401);
@@ -556,23 +432,51 @@ async function getEvents(req, env) {
   return json({events: []});
 }
 
-async function createProject(req, env) {
+// ---- Project CRUD ----
+
+async function createProject(req, env, ctx) {
   var body = await req.json();
   if (!body.seed || body.seed.length < 5) return json({error:'Seed too short'}, 400);
-  var questions = await generateQuestions(body.seed, env);
   var name = body.seed.split('.')[0].slice(0,40).trim() || 'Untitled';
   var uid = getUserId(req, env);
   var ut = getUserToken(req);
   if (!uid) return json({error:'Authentication required'}, 401);
+
+  // Create the project instantly with status='generating', empty questions
   var result = await sbQuery(env, 'chop_projects', {
     method: 'POST',
     userToken: ut,
-    body: {name: name, seed: body.seed, questions: questions, status: 'questions_generated', user_id: uid}
+    body: {name: name, seed: body.seed, questions: [], status: 'generating', user_id: uid}
   });
   var project = result && result[0];
   if (!project) return json({error:'Failed to create project'}, 500);
-  var ot = t(8);
-  return json({...project, owner_token: ot});
+
+  // Fire off the AI question generation via Edge Function
+  ctx.waitUntil((async function() {
+    try {
+      var efUrl = (env.SUPABASE_URL || 'https://ofggjtkweqlkncgablbm.supabase.co').replace(/\/+$/, '') + '/functions/v1/generate-questions';
+      var efResp = await fetch(efUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-SUPABASE-URL': env.SUPABASE_URL,
+          'X-SUPABASE-SERVICE-KEY': env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY,
+          'Authorization': 'Bearer ' + (ut || env.SUPABASE_SERVICE_KEY)
+        },
+        body: JSON.stringify({project_id: project.id})
+      });
+      if (!efResp.ok) {
+        var efErr = await efResp.text();
+        console.error('Background AI question gen failed for project', project.id, efResp.status, efErr);
+      } else {
+        console.log('Background AI question gen completed for project', project.id);
+      }
+    } catch(e) {
+      console.error('Background AI question gen error for project', project.id, e.message);
+    }
+  })());
+
+  return json(project);
 }
 
 async function addExpert(req, env, pid) {
@@ -586,7 +490,7 @@ async function addExpert(req, env, pid) {
   var result = await sbQuery(env, 'chop_experts', {
     method: 'POST',
     userToken: ut,
-    body: {project_id: pid, name: body.name, email: body.email||'', token: et, status:'pending', answered:0, total_questions: (p.questions||DEFAULT_QUESTIONS).length}
+    body: {project_id: pid, name: body.name, email: body.email||'', token: et, status:'pending', answered:0, total_questions: (p.questions||[]).length}
   });
   var expert = result && result[0];
   if (!expert) return json({error:'Failed to add expert'}, 500);
@@ -606,16 +510,66 @@ async function getProject(req, env, pid) {
   var experts = await sbQuery(env, 'chop_experts?project_id=eq.' + pid + '&select=*');
   if (!experts) experts = [];
   return json({...p, experts});
+}
+
+// ---- Synthesis ----
+
+async function triggerSynthesis(req, env, pid) {
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + pid + '&select=*');
+  var p = projects && projects[0];
+  if (!p) return json({error:'Not found'}, 404);
+
+  // If already synthesized, just return the cached result
+  if (p.status === 'synthesized' && p.synthesis_result) {
+    return json({status: 'ok', cached: true});
   }
 
-  async function expertQuestions(req, env, token) {
+  // Fire the Edge Function asynchronously
+  var ut = getUserToken(req);
+  await sbQuery(env, 'chop_projects?id=eq.' + pid, {method:'PATCH', body:{status:'synthesizing'}});
+
+  // Fire and forget via ctx.waitUntil would be ideal, but we need await for response
+  // Since this is a POST endpoint, we can fire it and return immediately
+  // The frontend will poll for completion
+  try {
+    var efUrl = (env.SUPABASE_URL || 'https://ofggjtkweqlkncgablbm.supabase.co').replace(/\/+$/, '') + '/functions/v1/synthesize-knowledge';
+    var efResp = await fetch(efUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-SUPABASE-URL': env.SUPABASE_URL,
+        'X-SUPABASE-SERVICE-KEY': env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY,
+        'Authorization': 'Bearer ' + (ut || env.SUPABASE_SERVICE_KEY)
+      },
+      body: JSON.stringify({project_id: pid})
+    });
+    if (!efResp.ok) {
+      var efErr = await efResp.text();
+      console.error('Synthesis EF returned error', efResp.status, efErr);
+      return json({status: 'error', error: efErr});
+    }
+    return json({status: 'ok'});
+  } catch(e) {
+    console.error('Synthesis EF error', e.message);
+    return json({status: 'error', error: e.message});
+  }
+}
+
+async function getSynthesisBundle(req, env, pid) {
+  var projects = await sbQuery(env, 'chop_projects?id=eq.' + pid + '&select=synthesis_result');
+  var p = projects && projects[0];
+  if (!p || !p.synthesis_result) return json({error:'No synthesis', bundle: null});
+  return json({bundle: p.synthesis_result.bundle || {}});
+}
+
+async function expertQuestions(req, env, token) {
   var experts = await sbQuery(env, 'chop_experts?token=eq.' + token + '&select=*');
   var expert = experts && experts[0];
   if (!expert) return json({error:'Not found'}, 404);
   var projects = await sbQuery(env, 'chop_projects?id=eq.' + expert.project_id + '&select=name,questions');
   var project = projects && projects[0];
   if (!project) return json({error:'Not found'}, 404);
-  var questions = project.questions || DEFAULT_QUESTIONS;
+  var questions = project.questions || [];
   var answers = await sbQuery(env, 'chop_answers?expert_id=eq.' + expert.id + '&select=*');
   if (!answers) answers = [];
   var as = questions.map(function(q, i) {
@@ -635,11 +589,10 @@ async function submitAnswer(req, env, token) {
   var projects = await sbQuery(env, 'chop_projects?id=eq.' + expert.project_id + '&select=name,questions');
   var project = projects && projects[0];
   if (!project) return json({error:'Not found'}, 404);
-  var questions = project.questions || DEFAULT_QUESTIONS;
+  var questions = project.questions || [];
   if (body.idx < 0 || body.idx >= questions.length) return json({error:'Invalid index'}, 400);
   var q = questions[body.idx];
   var ans = body.skip ? null : (body.text || '');
-  // Upsert answer
   var existing = await sbQuery(env, 'chop_answers?expert_id=eq.' + expert.id + '&question_id=eq.' + q.qid + '&select=*');
   if (existing && existing.length > 0) {
     var ts = new Date().toISOString();
@@ -647,7 +600,6 @@ async function submitAnswer(req, env, token) {
   } else {
     await sbQuery(env, 'chop_answers', {method:'POST', body:{project_id: expert.project_id, expert_id: expert.id, question_id: q.qid, question_text: q.text, category: q.category, answer: ans, skipped: !!body.skip}});
   }
-  // Count progress
   var allAnswers = await sbQuery(env, 'chop_answers?expert_id=eq.' + expert.id + '&select=*');
   if (!allAnswers) allAnswers = [];
   var answered = allAnswers.filter(function(a){return !a.skipped && a.answer;}).length;
@@ -658,7 +610,6 @@ async function submitAnswer(req, env, token) {
   } else {
     await sbQuery(env, 'chop_experts?id=eq.' + expert.id, {method:'PATCH', body:{answered: answered}});
   }
-  // Rebuild assignments
   var as = questions.map(function(qn, i) {
     var ea = allAnswers.find(function(a){return a.question_id === qn.qid;});
     return {idx:i, qid:qn.qid, category:qn.category, text:qn.text, answered:!!(ea && ea.answer), skipped: ea ? ea.skipped : false, answer: ea ? ea.answer : null};
@@ -667,420 +618,10 @@ async function submitAnswer(req, env, token) {
   return json({assignments:as, current_index:ci >= 0 ? ci : as.length});
 }
 
-async function synthesize(req, env, pid) {
-  var projects = await sbQuery(env, 'chop_projects?id=eq.' + pid + '&select=*');
-  var p = projects && projects[0];
-  if (!p) return json({error:'Not found'}, 404);
-  var experts = await sbQuery(env, 'chop_experts?project_id=eq.' + pid + '&select=*');
-  if (!experts) experts = [];
-  var respondents = experts.filter(function(e){return e.answered > 0});
-  var allAnswers = await sbQuery(env, 'chop_answers?project_id=eq.' + pid + '&select=*');
-  if (!allAnswers) allAnswers = [];
-  var all = [];
-  var expertMap = {};
-  for (var ei = 0; ei < experts.length; ei++) {
-    expertMap[experts[ei].id] = experts[ei].name;
-  }
-  for (var ai = 0; ai < allAnswers.length; ai++) {
-    var aa = allAnswers[ai];
-    if (aa.answer && !aa.skipped) {
-      all.push({name: expertMap[aa.expert_id] || 'Unknown', qid: aa.question_id, q: aa.question_text, a: aa.answer});
-    }
-  }
-  var byQ = {};
-  for (var k = 0; k < all.length; k++) {
-    if (!byQ[all[k].qid]) byQ[all[k].qid] = {qid:all[k].qid, q:all[k].q, answers:[]};
-    byQ[all[k].qid].answers.push({name:all[k].name, a:all[k].a});
-  }
-  var qidToCategory = {};
-  var questions = p.questions || [];
-  for (var qi = 0; qi < questions.length; qi++) {
-    qidToCategory[questions[qi].qid] = questions[qi].category;
-  }
-  var groups = Object.values(byQ);
-  var now = new Date();
-  var dateStr = now.toISOString().slice(0,10);
-  var timestamp = now.toISOString();
-
-  // ---- Group answers by category (still needed for the prompt and bundle) ----
-  var byCategory = {};
-  for (var ci = 0; ci < groups.length; ci++) {
-    var g = groups[ci];
-    var cat = qidToCategory[g.qid] || 'uncategorized';
-    if (!byCategory[cat]) byCategory[cat] = [];
-    byCategory[cat].push(g);
-  }
-
-  // Category display names and descriptions
-  var categoryMeta = {
-    scope:     {title: 'Scope',     description: 'Boundaries, systems, tools, and coverage areas.'},
-    persona:   {title: 'Persona',   description: 'Who needs this knowledge and what they need.'},
-    process:   {title: 'Process',   description: 'Core workflow steps, tools, and permissions.'},
-    people:    {title: 'People',    description: 'Key people, roles, and ownership.'},
-    gap:       {title: 'Gap',       description: 'What is undocumented or poorly understood.'},
-    failure:   {title: 'Failure',   description: 'Common mistakes and failure points.'},
-    source:    {title: 'Source',    description: 'Authoritative sources of truth.'}
-  };
-
-  // Determine confidence levels (kept for bundle building)
-  function confidenceLevel(catAnswers) {
-    var total = 0, expertsWithAnswer = {};
-    for (var i = 0; i < catAnswers.length; i++) {
-      for (var j = 0; j < catAnswers[i].answers.length; j++) {
-        expertsWithAnswer[catAnswers[i].answers[j].name] = true;
-        total++;
-      }
-    }
-    var numExperts = Object.keys(expertsWithAnswer).length;
-    if (numExperts >= 3 && total >= 5) return 'high';
-    if (numExperts >= 2 && total >= 3) return 'medium';
-    if (numExperts > 0) return 'low';
-    return 'none';
-  }
-
-  function escYaml(s) {
-    if (!s) return '';
-    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
-  }
-
-  function buildConceptFrontmatter(type, title, description, tags) {
-    var fm = '---\n';
-    fm += 'type: ' + type + '\n';
-    fm += 'title: ' + escYaml(title) + '\n';
-    fm += 'description: ' + escYaml(description) + '\n';
-    fm += 'tags: [' + tags.join(', ') + ']\n';
-    fm += 'timestamp: ' + timestamp + '\n';
-    fm += 'source: "' + escYaml(p.seed) + '"\n';
-    fm += '---\n';
-    return fm;
-  }
-
-  // ---- Build the AI synthesis prompt ----
-  var answerBlocks = '';
-  for (var gi = 0; gi < groups.length; gi++) {
-    var g = groups[gi];
-    var cat = qidToCategory[g.qid] || 'uncategorized';
-    answerBlocks += '## Question: ' + g.q + '\n';
-    answerBlocks += 'QID: ' + g.qid + ' | Category: ' + cat + '\n';
-    for (var ai = 0; ai < g.answers.length; ai++) {
-      answerBlocks += '- **' + g.answers[ai].name + '**: ' + g.answers[ai].a + '\n';
-    }
-    answerBlocks += '\n';
-  }
-
-  var systemPrompt = 'You are an expert knowledge synthesizer. Given raw expert interview answers about a topic, produce a coherent, structured knowledge document.';
-  systemPrompt += ' Identify consensus statements, flag divergences or disagreements, highlight uncertainty, and extract actionable takeaways.';
-  systemPrompt += ' Output valid markdown. Be thorough but concise.';
-  systemPrompt += ' CRITICAL: Do NOT simply repeat the raw answers. Synthesize them. Group related ideas, identify patterns, and flag contradictions.';
-  systemPrompt += ' Use headers, bullet points, and **bold** for emphasis. Do NOT wrap in code fences.';
-
-  var userPrompt = 'Synthesize the following expert answers into a structured knowledge document.\n\n';
-  userPrompt += 'Project: ' + p.name + '\n';
-  userPrompt += 'Seed topic: ' + p.seed + '\n\n';
-  userPrompt += '## Expert Answers\n\n';
-  userPrompt += answerBlocks;
-  userPrompt += '\n\nProduce a markdown document with the following sections:\n';
-  userPrompt += '1. **Executive Summary** — 2-3 paragraph synthesis of the key takeaways from all answers. What would someone need to know after reading this?.\n';
-  userPrompt += '2. **Key Insights by Category** — For each category that has answers, provide: (a) consensus statements (what experts agreed on), (b) divergence notes (where they disagreed or offered different perspectives), and (c) uncertainty flags (areas lacking data). Group related answers, don\'t just list them.\n';
-  userPrompt += '3. **Actionable Takeaways** — Concrete next steps, decisions, or actions implied by the knowledge. Who should do what?.\n';
-  userPrompt += '4. **Gaps & Recommended Follow-ups** — What is missing or needs further investigation, and who might know the answers.\n\n';
-  userPrompt += 'Format: clean markdown with headers. Be analytical — don\'t just summarize, actually synthesize. Flag specific expert names when they hold unique knowledge. Do NOT wrap the entire output in a code fence.';
-
-  // ---- Call OpenRouter for AI synthesis ----
-  var apiKey = await fetchOpenRouterKey(env);
-  var md = '';
-  var mdFallback = '';
-
-  if (apiKey) {
-    try {
-      var response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + apiKey,
-          'HTTP-Referer': 'https://chop-mvp.nousresearch.com',
-          'X-Title': 'Chop MVP'
-        },
-        body: JSON.stringify({
-          model: 'openai/gpt-4o',
-          messages: [
-            {role: 'system', content: systemPrompt},
-            {role: 'user', content: userPrompt}
-          ],
-          temperature: 0.7,
-          max_tokens: 4000
-        })
-      });
-
-      if (response.ok) {
-        var data = await response.json();
-        var content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-        if (content) {
-          md = content.trim();
-          // Strip code fences if model adds them
-          if (md.startsWith('```markdown')) md = md.slice(12);
-          else if (md.startsWith('```')) md = md.slice(3);
-          if (md.endsWith('```')) md = md.slice(0, -3);
-          md = md.trim();
-        }
-      } else {
-        console.error('synthesize: API returned ' + response.status, await response.text());
-      }
-    } catch (e) {
-      console.error('synthesize: Exception calling OpenRouter', e.message);
-    }
-  } else {
-    console.error('synthesize: Could not retrieve OPENROUTER_API_KEY from Supabase');
-  }
-
-  // ---- Fallback: if AI call failed, produce a basic structured document ----
-  if (!md) {
-    md = '# ' + p.name + ' - Context Summary\n\n';
-    md += '> **Note:** AI synthesis was unavailable. This is a structured fallback document.\n\n';
-    md += '## Metadata\n';
-    md += '- **Seed:** ' + p.seed + '\n';
-    md += '- **Respondents:** ' + respondents.map(function(e){return e.name}).join(', ') + '\n';
-    md += '- **Questions Answered:** ' + all.length + '\n';
-    md += '- **Generated:** ' + dateStr + '\n\n';
-    md += '## Answers by Category\n\n';
-    var catKeys = Object.keys(categoryMeta);
-    for (var fci = 0; fci < catKeys.length; fci++) {
-      var cat = catKeys[fci];
-      var catAnswers = byCategory[cat];
-      var meta = categoryMeta[cat];
-      if (!catAnswers || catAnswers.length === 0) continue;
-      md += '### ' + meta.title + '\n\n';
-      md += '*Confidence: ' + confidenceLevel(catAnswers) + '*\n\n';
-      for (var fq = 0; fq < catAnswers.length; fq++) {
-        var q = catAnswers[fq];
-        md += '**' + q.q + '** (QID: ' + q.qid + ')\n\n';
-        for (var fa = 0; fa < q.answers.length; fa++) {
-          md += '- **' + q.answers[fa].name + ':** ' + q.answers[fa].a + '\n';
-        }
-        md += '\n';
-      }
-    }
-    md += '---\n';
-    md += '*Fallback document — no AI synthesis was performed.*\n';
-  }
-
-  // ---- Build AI-synthesized OKF Bundle ----
-  // The AI-produced md is used as the primary content. We also build a structured
-  // OKF bundle where concept files contain the AI-synthesized category insights.
-
-  // First, ask the model to produce per-category summaries for the bundle files.
-  var bundlePrompt = 'Based on the same expert answers below, produce a structured JSON output with per-category summaries.';
-  bundlePrompt += ' The JSON must have this exact structure:\n';
-  bundlePrompt += '{\n';
-  bundlePrompt += '  "category_summaries": {\n';
-  bundlePrompt += '    "scope": {"summary": "...", "consensus": ["..."], "divergence": ["..."], "takeaways": ["..."]},\n';
-  bundlePrompt += '    "persona": {...},\n';
-  bundlePrompt += '    ... only categories that have answers ...\n';
-  bundlePrompt += '  },\n';
-  bundlePrompt += '  "index_summary": "2-3 sentence bundle overview",\n';
-  bundlePrompt += '  "log_notes": "1-2 sentences on what was captured"\n';
-  bundlePrompt += '}\n\n';
-  bundlePrompt += 'Expert answers:\n' + answerBlocks;
-  bundlePrompt += '\n\nOutput ONLY the JSON object. No markdown fences, no commentary.';
-
-  var bundleJson = null;
-  if (apiKey) {
-    try {
-      var bundleResp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + apiKey,
-          'HTTP-Referer': 'https://chop-mvp.nousresearch.com',
-          'X-Title': 'Chop MVP'
-        },
-        body: JSON.stringify({
-          model: 'openai/gpt-4o',
-          messages: [
-            {role: 'system', content: 'You produce structured JSON summaries from expert answers. Output ONLY valid JSON.'},
-            {role: 'user', content: bundlePrompt}
-          ],
-          temperature: 0.5,
-          max_tokens: 3000
-        })
-      });
-
-      if (bundleResp.ok) {
-        var bundleData = await bundleResp.json();
-        var bundleContent = bundleData.choices && bundleData.choices[0] && bundleData.choices[0].message && bundleData.choices[0].message.content;
-        if (bundleContent) {
-          bundleContent = bundleContent.trim();
-          if (bundleContent.startsWith('```json')) bundleContent = bundleContent.slice(7);
-          else if (bundleContent.startsWith('```')) bundleContent = bundleContent.slice(3);
-          if (bundleContent.endsWith('```')) bundleContent = bundleContent.slice(0, -3);
-          bundleContent = bundleContent.trim();
-          bundleJson = JSON.parse(bundleContent);
-        }
-      } else {
-        console.error('synthesize: Bundle API returned ' + bundleResp.status, await bundleResp.text());
-      }
-    } catch (e) {
-      console.error('synthesize: Exception fetching bundle summaries', e.message);
-    }
-  }
-
-  // Build the bundle object
-  var bundle = {};
-  var catKeys = Object.keys(categoryMeta);
-
-  // Helper to create concept file content using AI summaries if available
-  function buildCategoryContent(cat, meta, catAnswers, bundleJson) {
-    var body = buildConceptFrontmatter('Concept', meta.title + ' — ' + p.name, meta.description, ['chop', 'knowledge-capture', cat]);
-    body += '\n# ' + meta.title + '\n\n';
-    body += meta.description + '\n\n';
-    body += 'Part of the **[Knowledge Bundle](./index.md)** for *' + p.name + '*.\n\n';
-    body += '**Confidence:** ' + confidenceLevel(catAnswers || []) + '\n\n';
-
-    if (bundleJson && bundleJson.category_summaries && bundleJson.category_summaries[cat]) {
-      var cs = bundleJson.category_summaries[cat];
-      if (cs.summary) {
-        body += '## Summary\n\n' + cs.summary + '\n\n';
-      }
-      if (cs.consensus && cs.consensus.length > 0) {
-        body += '## Consensus\n\n';
-        for (var ci2 = 0; ci2 < cs.consensus.length; ci2++) {
-          body += '- ' + cs.consensus[ci2] + '\n';
-        }
-        body += '\n';
-      }
-      if (cs.divergence && cs.divergence.length > 0) {
-        body += '## Divergence\n\n';
-        for (var di = 0; di < cs.divergence.length; di++) {
-          body += '- ' + cs.divergence[di] + '\n';
-        }
-        body += '\n';
-      }
-      if (cs.takeaways && cs.takeaways.length > 0) {
-        body += '## Takeaways\n\n';
-        for (var ti = 0; ti < cs.takeaways.length; ti++) {
-          body += '- ' + cs.takeaways[ti] + '\n';
-        }
-        body += '\n';
-      }
-    } else {
-      body += '## Answers\n\n';
-      if (!catAnswers || catAnswers.length === 0) {
-        body += '*No answers recorded for this category.*\n';
-      } else {
-        for (var ca = 0; ca < catAnswers.length; ca++) {
-          var q = catAnswers[ca];
-          body += '### ' + q.q + '\n\n';
-          body += '> **Question ID:** ' + q.qid + '\n\n';
-          for (var aii = 0; aii < q.answers.length; aii++) {
-            body += '<details>\n<summary><strong>' + escHtml(q.answers[aii].name) + '</strong> answered:</summary>\n\n';
-            body += q.answers[aii].a + '\n\n';
-            body += '</details>\n\n';
-          }
-          body += '---\n\n';
-        }
-      }
-    }
-
-    // Cross-link to other categories
-    body += '## Related\n\n';
-    body += '- [Back to Bundle Index](./index.md)\n';
-    for (var cl = 0; cl < catKeys.length; cl++) {
-      if (catKeys[cl] !== cat && byCategory[catKeys[cl]]) {
-        body += '- [' + categoryMeta[catKeys[cl]].title + '](./' + catKeys[cl] + '.md)\n';
-      }
-    }
-    var respondentLinks = '';
-    for (var rl = 0; rl < respondents.length; rl++) {
-      respondentLinks += '- ' + respondents[rl].name + '\n';
-    }
-    if (respondentLinks) {
-      body += '\n## Contributors\n\n' + respondentLinks;
-    }
-    return body;
-  }
-
-  // Build concept files
-  for (var ck = 0; ck < catKeys.length; ck++) {
-    var cat = catKeys[ck];
-    var catAnswers = byCategory[cat];
-    var meta = categoryMeta[cat];
-    var fileName = cat + '.md';
-    bundle[fileName] = buildCategoryContent(cat, meta, catAnswers, bundleJson);
-  }
-
-  // Build index.md
-  var indexSummary = '';
-  if (bundleJson && bundleJson.index_summary) {
-    indexSummary = bundleJson.index_summary;
-  }
-  var indexBody = '---\n';
-  indexBody += 'type: KnowledgeBundle\n';
-  indexBody += 'title: ' + escYaml(p.name) + '\n';
-  indexBody += 'description: "Chop-captured knowledge generated from expert interviews about: ' + escYaml(p.seed) + '"\n';
-  indexBody += 'tags: [chop, knowledge-capture, bundle]\n';
-  indexBody += 'timestamp: ' + timestamp + '\n';
-  indexBody += 'okf_version: "0.2"\n';
-  indexBody += 'source: "' + escYaml(p.seed) + '"\n';
-  indexBody += '---\n\n';
-  indexBody += '# ' + p.name + '\n\n';
-  indexBody += 'Captured on ' + dateStr + ' via **Chop** — an interview-loop knowledge capture tool.\n\n';
-  if (indexSummary) {
-    indexBody += indexSummary + '\n\n';
-  }
-  indexBody += '## Metadata\n\n';
-  indexBody += '- **Seed:** ' + p.seed + '\n';
-  indexBody += '- **Respondents:** ' + respondents.map(function(e){return e.name}).join(', ') + '\n';
-  indexBody += '- **Questions Answered:** ' + all.length + '\n';
-  indexBody += '- **Categories:** ' + Object.keys(byCategory).length + '\n\n';
-  indexBody += '## Concepts\n\n';
-  for (var ic = 0; ic < catKeys.length; ic++) {
-    var icat = catKeys[ic];
-    var imeta = categoryMeta[icat];
-    var icount = (byCategory[icat] || []).length;
-    indexBody += '- [' + imeta.title + '](' + icat + '.md) — ' + imeta.description;
-    if (icount > 0) indexBody += ' (' + icount + ' question' + (icount > 1 ? 's' : '') + ')';
-    indexBody += '\n';
-  }
-  indexBody += '\n## Contributors\n\n';
-  for (var ic2 = 0; ic2 < respondents.length; ic2++) {
-    indexBody += '- ' + respondents[ic2].name + '\n';
-  }
-  bundle['index.md'] = indexBody;
-
-  // Build log.md
-  var logNotes = '';
-  if (bundleJson && bundleJson.log_notes) {
-    logNotes = bundleJson.log_notes;
-  }
-  var logBody = '---\n';
-  logBody += 'type: Log\n';
-  logBody += 'title: Capture Log — ' + p.name + '\n';
-  logBody += 'tags: [chop, log]\n';
-  logBody += 'timestamp: ' + timestamp + '\n';
-  logBody += '---\n\n';
-  logBody += '# Capture Log\n\n';
-  logBody += '## ' + dateStr + '\n';
-  logBody += '* **Creation:** Bundle created from Chop capture session.\n';
-  logBody += '* **Seed:** "' + p.seed + '"\n';
-  logBody += '* **Respondents:** ' + respondents.length + ' expert' + (respondents.length !== 1 ? 's' : '') + ' contributed.\n';
-  logBody += '* **Total answers:** ' + all.length + '\n';
-  if (logNotes) {
-    logBody += '* **Notes:** ' + logNotes + '\n';
-  }
-  for (var lc = 0; lc < respondents.length; lc++) {
-    logBody += '* **' + respondents[lc].name + '** completed ' + respondents[lc].answered + ' question' + (respondents[lc].answered !== 1 ? 's' : '') + '.\n';
-  }
-  bundle['log.md'] = logBody;
-
-  await sbQuery(env, 'chop_projects?id=eq.' + pid, {method:'PATCH', body:{status:'synthesized'}});
-  return json({markdown:md, bundle:bundle});
-}
-
 // Helpers
 function escHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function json(d, s) { return new Response(JSON.stringify(d), {status:s||200, headers:{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}}); }
 
-// Supabase REST API helpers
 function sbUrl(env) { return env.SUPABASE_URL; }
 function sbKey(env) { return env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY; }
 function sbAnonKey(env) { return env.SUPABASE_ANON_KEY; }
@@ -1118,13 +659,9 @@ async function sbAuth(env, path, body) {
 }
 
 function sbUser(token, env) {
-  // GET /auth/v1/user with the user's JWT
   return fetch(env.SUPABASE_URL + '/auth/v1/user', {
     method: 'GET',
-    headers: {
-      'apikey': sbAnonKey(env),
-      'Authorization': 'Bearer ' + token
-    }
+    headers: {'apikey': sbAnonKey(env), 'Authorization': 'Bearer ' + token}
   });
 }
 
@@ -1145,15 +682,18 @@ function getAuthToken(req) {
   return m ? m[1] : null;
 }
 
+function getUserToken(req) {
+  var auth = req.headers.get('Authorization');
+  if (auth && auth.startsWith('Bearer ')) return auth.slice(7);
+  return null;
+}
+
 // Auth handlers
 async function handleSignup(req, env) {
   var body = await req.json();
   var r = await sbAuth(env, 'signup', {email: body.email, password: body.password});
   if (!r.ok) return json({error: (r.data && (r.data.msg || r.data.error_description)) || 'Signup failed'}, 400);
-  return json({
-    user: r.data.user,
-    session: r.data.session ? {access_token: r.data.session.access_token, expires_in: r.data.session.expires_in} : null
-  });
+  return json({user: r.data.user, session: r.data.session ? {access_token: r.data.session.access_token, expires_in: r.data.session.expires_in} : null});
 }
 
 async function handleLogin(req, env) {
@@ -1180,53 +720,7 @@ async function handleMe(req, env) {
   } catch(e) { return json({user: null}); }
 }
 
-function getUserId(req, env) {
-  var token = getAuthToken(req);
-  return token ? jwtUserId(token) : null;
-}
-
-function getUserToken(req) {
-  var auth = req.headers.get('Authorization');
-  if (auth && auth.startsWith('Bearer ')) return auth.slice(7);
-  return null;
-}
-
-// Fetches the OpenRouter API key from Supabase chop_config table
-// This avoids storing secrets as Worker env vars — just update the DB.
-async function fetchOpenRouterKey(env) {
-  try {
-    var resp = await fetch(env.SUPABASE_URL + '/rest/v1/chop_config?key=eq.openrouter_api_key&select=value', {
-      headers: {
-        'apikey': env.SUPABASE_ANON_KEY,
-        'Authorization': 'Bearer ' + env.SUPABASE_ANON_KEY
-      }
-    });
-    if (!resp.ok) {
-      console.error('fetchOpenRouterKey: HTTP ' + resp.status);
-      return null;
-    }
-    var data = await resp.json();
-    if (data && data.length > 0 && data[0].value) {
-      return data[0].value;
-    }
-    console.error('fetchOpenRouterKey: No config row found');
-    return null;
-  } catch(e) {
-    console.error('fetchOpenRouterKey: Error', e);
-    return null;
-  }
-}
-
-// In-memory store (no KV dependency) -- looks like a KV namespace
-// Also logs events to BigQuery queue_master_payloads table
-var store = {
-  _data: {},
-  async get(key) { return this._data[key] || null; },
-  async put(key, val) { this._data[key] = val; }
-};
-
-// Replace store with `store` -- the router still receives `env` for other uses
-// Routes
+// Router
 export default {
   async fetch(request, env, ctx) {
     var url = new URL(request.url);
@@ -1234,20 +728,20 @@ export default {
     var method = request.method;
     if (method === 'OPTIONS') return new Response(null, {status:204, headers:{'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,PUT','Access-Control-Allow-Headers':'Content-Type,X-Owner-Token,Authorization'}});
 
-    // Auth - keep existing auth API routes
+    // Auth API
     if (path === '/auth/signup' && method === 'POST') return handleSignup(request, env);
     if (path === '/auth/login' && method === 'POST') return handleLogin(request, env);
     if (path === '/auth/logout' && method === 'POST') return handleLogout(request, env);
     if (path === '/auth/me' && method === 'GET') return handleMe(request, env);
 
-    // Auth UI routes (before project routes so they match first)
+    // Auth UI
     if (path === '/login' && method === 'GET') return loginPage(request, env);
     if (path === '/login/login' && method === 'POST') return loginPost(request, env);
     if (path === '/login/signup' && method === 'POST') return signupPost(request, env);
 
-    // API - list user projects (needs auth)
+    // API - projects
     if (path === '/api/projects' && method === 'GET') return listUserProjects(request, env);
-    if (path === '/api/projects' && method === 'POST') return createProject(request, env);
+    if (path === '/api/projects' && method === 'POST') return createProject(request, env, ctx);
     if (path === '/api/admin/events') return getEvents(request, env);
 
     var m = path.match(/^\/api\/projects\/([^/]+)$/);
@@ -1257,9 +751,15 @@ export default {
     if (m && method === 'POST') return addExpert(request, env, m[1]);
     if (m && method === 'GET') return listExperts(request, env, m[1]);
 
+    // Synthesis
     m = path.match(/^\/api\/projects\/([^/]+)\/synthesize$/);
-    if (m && method === 'POST') return synthesize(request, env, m[1]);
+    if (m && method === 'POST') return triggerSynthesis(request, env, m[1]);
 
+    m = path.match(/^\/api\/projects\/([^/]+)\/synthesize\/download$/);
+    if (m && method === 'GET') return getSynthesisBundle(request, env, m[1]);
+    if (m && method === 'POST') return getSynthesisBundle(request, env, m[1]);
+
+    // Answer routes
     m = path.match(/^\/api\/answer\/([^/]+)\/questions$/);
     if (m && method === 'GET') return expertQuestions(request, env, m[1]);
 
