@@ -5,6 +5,12 @@
 const B62 = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 function t(n) { let s='';for(let i=n||8;i>0;i--)s+=B62[Math.random()*62|0];return s; }
 
+// Hardcoded defaults so the worker works even without env vars set
+// (service key needed for auto_confirm_user RPC, anon key is for public REST/Auth)
+var _supabaseUrl = 'https://ribbwqtpcrltkgaazllu.supabase.co';
+var _supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJpYmJ3cXRwY3JsdGtnYWF6bGx1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzNDEzMjMsImV4cCI6MjA5MTkxNzMyM30.V8rDOWk7-UIIPIZdRYKt1LFeAaZ9kGYzQJDruHnrDEQ';
+var _supabaseServiceKey = ''; // Set SUPABASE_SERVICE_KEY env var for auto_confirm_user
+
 // HTML shell
 const CSS = '*{box-sizing:border-box;margin:0;padding:0}'+
 'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f0f0f;color:#e0e0e0}'+
@@ -440,13 +446,14 @@ async function createProject(req, env, ctx) {
   var name = body.seed.split('.')[0].slice(0,40).trim() || 'Untitled';
   var uid = getUserId(req, env);
   var ut = getUserToken(req);
-  if (!uid) return json({error:'Authentication required'}, 401);
 
   // Create the project instantly with status='generating', empty questions
+  var projBody = {name: name, seed: body.seed, questions: [], status: 'generating'};
+  if (uid) projBody.user_id = uid;
   var result = await sbQuery(env, 'chop_projects', {
     method: 'POST',
     userToken: ut,
-    body: {name: name, seed: body.seed, questions: [], status: 'generating', user_id: uid}
+    body: projBody
   });
   var project = result && result[0];
   if (!project) return json({error:'Failed to create project'}, 500);
@@ -454,14 +461,14 @@ async function createProject(req, env, ctx) {
   // Fire off the AI question generation via Edge Function
   ctx.waitUntil((async function() {
     try {
-      var efUrl = (env.SUPABASE_URL || 'https://ofggjtkweqlkncgablbm.supabase.co').replace(/\/+$/, '') + '/functions/v1/generate-questions';
+      var efUrl = (env.SUPABASE_URL || _supabaseUrl).replace(/\/+$/, '') + '/functions/v1/generate-questions';
       var efResp = await fetch(efUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-SUPABASE-URL': env.SUPABASE_URL,
-          'X-SUPABASE-SERVICE-KEY': env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY,
-          'Authorization': 'Bearer ' + (ut || env.SUPABASE_SERVICE_KEY)
+          'X-SUPABASE-URL': sbUrl(env),
+          'X-SUPABASE-SERVICE-KEY': sbKey(env),
+          'Authorization': 'Bearer ' + (ut || sbKey(env))
         },
         body: JSON.stringify({project_id: project.id})
       });
@@ -532,14 +539,14 @@ async function triggerSynthesis(req, env, pid) {
   // Since this is a POST endpoint, we can fire it and return immediately
   // The frontend will poll for completion
   try {
-    var efUrl = (env.SUPABASE_URL || 'https://ofggjtkweqlkncgablbm.supabase.co').replace(/\/+$/, '') + '/functions/v1/synthesize-knowledge';
+    var efUrl = (sbUrl(env)).replace(/\/+$/, '') + '/functions/v1/synthesize-knowledge';
     var efResp = await fetch(efUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-SUPABASE-URL': env.SUPABASE_URL,
-        'X-SUPABASE-SERVICE-KEY': env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY,
-        'Authorization': 'Bearer ' + (ut || env.SUPABASE_SERVICE_KEY)
+        'X-SUPABASE-URL': sbUrl(env),
+        'X-SUPABASE-SERVICE-KEY': sbKey(env),
+        'Authorization': 'Bearer ' + (ut || sbKey(env))
       },
       body: JSON.stringify({project_id: pid})
     });
@@ -622,9 +629,9 @@ async function submitAnswer(req, env, token) {
 function escHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function json(d, s) { return new Response(JSON.stringify(d), {status:s||200, headers:{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'}}); }
 
-function sbUrl(env) { return env.SUPABASE_URL; }
-function sbKey(env) { return env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY; }
-function sbAnonKey(env) { return env.SUPABASE_ANON_KEY; }
+function sbUrl(env) { return env.SUPABASE_URL || _supabaseUrl; }
+function sbKey(env) { return env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY || _supabaseAnonKey; }
+function sbAnonKey(env) { return env.SUPABASE_ANON_KEY || _supabaseAnonKey; }
 
 async function sbQuery(env, path, opts) {
   var url = env.SUPABASE_URL + '/rest/v1/' + path;
