@@ -211,8 +211,8 @@ async function signupPost(req, env) {
         await fetch(sbUrl(env) + '/rest/v1/rpc/auto_confirm_user', {
           method: 'POST',
           headers: {
-            'apikey': env.SUPABASE_SERVICE_KEY,
-            'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
+            'apikey': sbKey(env),
+            'Authorization': 'Bearer ' + sbKey(env),
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({user_id: userId})
@@ -670,6 +670,12 @@ function sbUser(token, env) {
     method: 'GET',
     headers: {'apikey': sbAnonKey(env), 'Authorization': 'Bearer ' + token}
   });
+}
+
+function getUserId(req, env) {
+  var token = getAuthToken(req);
+  if (!token) return null;
+  return jwtUserId(token);
 }
 
 function jwtUserId(token) {
