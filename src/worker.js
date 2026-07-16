@@ -208,7 +208,7 @@ async function signupPost(req, env) {
     var userId = r.data && (r.data.id || (r.data.user && r.data.user.id));
     if (userId) {
       try {
-        await fetch(env.SUPABASE_URL + '/rest/v1/rpc/auto_confirm_user', {
+        await fetch(sbUrl(env) + '/rest/v1/rpc/auto_confirm_user', {
           method: 'POST',
           headers: {
             'apikey': env.SUPABASE_SERVICE_KEY,
@@ -634,7 +634,7 @@ function sbKey(env) { return env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY |
 function sbAnonKey(env) { return env.SUPABASE_ANON_KEY || _supabaseAnonKey; }
 
 async function sbQuery(env, path, opts) {
-  var url = env.SUPABASE_URL + '/rest/v1/' + path;
+  var url = sbUrl(env) + '/rest/v1/' + path;
   var bearerKey = (opts && opts.userToken) || sbKey(env);
   var headers = {
     'apikey': sbKey(env),
@@ -657,7 +657,7 @@ async function sbQuery(env, path, opts) {
 }
 
 async function sbAuth(env, path, body) {
-  var res = await fetch(env.SUPABASE_URL + '/auth/v1/' + path, {
+  var res = await fetch(sbUrl(env) + '/auth/v1/' + path, {
     method: 'POST',
     headers: {'apikey': sbAnonKey(env), 'Content-Type': 'application/json'},
     body: JSON.stringify(body)
@@ -666,7 +666,7 @@ async function sbAuth(env, path, body) {
 }
 
 function sbUser(token, env) {
-  return fetch(env.SUPABASE_URL + '/auth/v1/user', {
+  return fetch(sbUrl(env) + '/auth/v1/user', {
     method: 'GET',
     headers: {'apikey': sbAnonKey(env), 'Authorization': 'Bearer ' + token}
   });
