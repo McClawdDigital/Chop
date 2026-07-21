@@ -1,70 +1,14 @@
 // Chop: Generate Questions Edge Function
-// Called asynchronously after a project is created.
-// Fetches the seed, calls OpenRouter, saves questions back.
-// Deno runtime — no 30s Worker CPU limit.
+// CONFIGURATION — edit these values to change model, prompt, or OpenRouter settings
+const OPENROUTER_MODEL = 'z-ai/glm-4.7-flash';
+const OPENROUTER_TEMPERATURE = 0.7;
+const OPENROUTER_MAX_TOKENS = 2000;
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_REFERER = 'https://chop-mvp.cloudflare-rake998.workers.dev';
+const OPENROUTER_TITLE = 'Chop MVP';
+// === END CONFIGURATION ===
 
-interface Env {
-  SUPABASE_URL: string;
-  SUPABASE_ANON_KEY: string;
-  SUPABASE_SERVICE_KEY: string;
-}
-
-interface OpenRouterResponse {
-  choices: Array<{
-    message: {
-      content: string;
-    };
-  }>;
-}
-
-interface Question {
-  qid: string;
-  category: string;
-  text: string;
-}
-
-const DEFAULT_QUESTIONS: Question[] = [
-  {qid:'Q-SCOPE-01',category:'scope',text:'What specific systems, tools, or processes does this topic cover?'},
-  {qid:'Q-SCOPE-02',category:'scope',text:'What is explicitly OUT of scope for this knowledge base?'},
-  {qid:'Q-PERSONA-01',category:'persona',text:'Who needs this knowledge most? What do new people need to know?'},
-  {qid:'Q-PROCESS-01',category:'process',text:'How does the core process work today? Walk through it step by step.'},
-  {qid:'Q-PROCESS-02',category:'process',text:'What tools or permissions are needed to do this work?'},
-  {qid:'Q-PEOPLE-01',category:'people',text:'Who are the key people involved? Who owns each part?'},
-  {qid:'Q-GAP-01',category:'gap',text:'What is currently undocumented or poorly understood about this topic?'},
-  {qid:'Q-FAILURE-01',category:'failure',text:'What are the most common mistakes or failure points?'},
-  {qid:'Q-SOURCE-01',category:'source',text:'Where does the authoritative truth live? (docs, dashboards, people)'},
-  {qid:'Q-PERSONA-02',category:'persona',text:'If someone new joined tomorrow, what would they be confused about?'},
-];
-
-async function getOpenRouterKey(supabaseUrl: string, serviceKey: string): Promise<string | null> {
-  try {
-    const resp = await fetch(
-      `${supabaseUrl}/rest/v1/chop_config?key=eq.openrouter_api_key&select=value`,
-      {
-        headers: {
-          'apikey': serviceKey,
-          'Authorization': `Bearer ${serviceKey}`,
-        },
-      }
-    );
-    if (!resp.ok) {
-      console.error(`getOpenRouterKey: HTTP ${resp.status}`);
-      return null;
-    }
-    const data = await resp.json();
-    if (data && data.length > 0 && data[0].value) {
-      return data[0].value;
-    }
-    console.error('getOpenRouterKey: No config row found');
-    return null;
-  } catch (e) {
-    console.error('getOpenRouterKey: Error', e);
-    return null;
-  }
-}
-
-async function generateQuestions(seed: string, apiKey: string): Promise<Question[]> {
-  const systemPrompt = `You are a knowledge-capture question designer. Your job is to decompose a seed topic into its concrete, named components and generate anchor-specific questions.
+const SYSTEM_PROMPT = `You are a knowledge-capture question designer. Your job is to decompose a seed topic into its concrete, named components and generate anchor-specific questions.
 
 ## AI-FIRST QUESTION DESIGN PRINCIPLES
 
@@ -84,198 +28,107 @@ Extract from the seed:
 5. **Generate 10-12 questions total.**
 6. **Output ONLY a valid JSON array.** No markdown fences, no commentary.`;
 
-  const userPrompt = `Seed topic: "${seed}"
+const USER_PROMPT_PREFIX = `## Decomposition\nExtract the named entities, tools, roles, processes, constraints, and gaps from this seed. List them explicitly.\n\n## Questions\nNow generate 10-12 deeply specific, anchor-heavy questions. Every question MUST name at least 2 specific things from the decomposition.\n\nOutput ONLY a valid JSON array. No markdown fences, no commentary, no explanation.\n\nEach question object MUST use these fields: "qid" (e.g. Q-1), "category" (one of: scope, persona, process, people, gap, failure, source), "text" (the question text).`;
+// === END CONFIGURATION ===
 
-## Decomposition
-Extract the named entities, tools, roles, processes, constraints, and gaps from this seed. List them explicitly.
+interface Question { qid: string; category: string; text: string; }
+const DEFAULT_QUESTIONS: Question[] = [
+  {qid:'Q-SCOPE-01',category:'scope',text:'What specific systems, tools, or processes does this topic cover?'},
+  {qid:'Q-SCOPE-02',category:'scope',text:'What is explicitly OUT of scope for this knowledge base?'},
+  {qid:'Q-PERSONA-01',category:'persona',text:'Who needs this knowledge most? What do new people need to know?'},
+  {qid:'Q-PROCESS-01',category:'process',text:'How does the core process work today? Walk through it step by step.'},
+  {qid:'Q-PROCESS-02',category:'process',text:'What tools or permissions are needed to do this work?'},
+  {qid:'Q-PEOPLE-01',category:'people',text:'Who are the key people involved? Who owns each part?'},
+  {qid:'Q-GAP-01',category:'gap',text:'What is currently undocumented or poorly understood about this topic?'},
+  {qid:'Q-FAILURE-01',category:'failure',text:'What are the most common mistakes or failure points?'},
+  {qid:'Q-SOURCE-01',category:'source',text:'Where does the authoritative truth live? (docs, dashboards, people)'},
+  {qid:'Q-PERSONA-02',category:'persona',text:'If someone new joined tomorrow, what would they be confused about?'},
+];
 
-## Questions
-Now generate 10-12 deeply specific, anchor-heavy questions. Every question MUST name at least 2 specific things from the decomposition.
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+function json(body: any, status = 200) { return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', ...CORS } }); }
 
-Output ONLY a valid JSON array. No markdown fences, no commentary, no explanation.`;
-
+async function getOpenRouterKey(supabaseUrl: string, serviceKey: string): Promise<string | null> {
+  const envKey = Deno.env.get('OPENROUTER_API_KEY');
+  if (envKey) return envKey;
   try {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://chop-mvp.cloudflare-rake998.workers.dev',
-        'X-Title': 'Chop MVP',
-      },
-      body: JSON.stringify({
-        model: 'openai/gpt-4o',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        temperature: 0.7,
-        max_tokens: 2000,
-      }),
+    const resp = await fetch(`${supabaseUrl}/rest/v1/chop_config?key=eq.openrouter_api_key&select=value`,
+      { headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}` } });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data?.[0]?.value || null;
+  } catch { return null; }
+}
+
+async function generateQuestions(seed: string, apiKey: string): Promise<Question[]> {
+  const userPrompt = `Seed topic: "${seed}"\n\n${USER_PROMPT_PREFIX}`;
+  try {
+    const response = await fetch(OPENROUTER_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'HTTP-Referer': OPENROUTER_REFERER, 'X-Title': OPENROUTER_TITLE },
+      body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userPrompt }], temperature: OPENROUTER_TEMPERATURE, max_tokens: OPENROUTER_MAX_TOKENS }),
     });
-
-    if (!response.ok) {
-      const text = await response.text();
-      console.error(`OpenRouter returned ${response.status}: ${text}`);
-      return DEFAULT_QUESTIONS;
-    }
-
-    const data: OpenRouterResponse = await response.json();
+    if (!response.ok) { console.error(`OpenRouter ${response.status}`); return DEFAULT_QUESTIONS; }
+    const data = await response.json();
     let content = data.choices?.[0]?.message?.content;
-    if (!content) {
-      console.error('No content in OpenRouter response');
-      return DEFAULT_QUESTIONS;
-    }
-
-    // Strip markdown fences
-    content = content.trim();
-    if (content.startsWith('```json')) content = content.slice(7);
-    else if (content.startsWith('```')) content = content.slice(3);
-    if (content.endsWith('```')) content = content.slice(0, -3);
-    content = content.trim();
-
+    if (!content) return DEFAULT_QUESTIONS;
+    content = content.trim().replace(/^```(?:json)?\n?/,'').replace(/```$/,'').trim();
     const questions: Question[] = JSON.parse(content);
-
-    // Validate
-    if (!Array.isArray(questions) || questions.length < 8 || questions.length > 12) {
-      console.error(`Invalid question count: ${questions.length}`);
-      return DEFAULT_QUESTIONS;
-    }
-
-    const validCategories = ['scope', 'persona', 'process', 'people', 'gap', 'failure', 'source'];
-    for (let i = 0; i < questions.length; i++) {
-      const q = questions[i];
-      if (!q.qid || !q.category || !q.text || !validCategories.includes(q.category)) {
-        console.error(`Invalid question at index ${i}: ${JSON.stringify(q)}`);
-        return DEFAULT_QUESTIONS;
-      }
-    }
-
-    return questions;
-  } catch (e: any) {
-    console.error(`OpenRouter exception: ${e.message}`);
-    return DEFAULT_QUESTIONS;
-  }
+    if (!Array.isArray(questions) || questions.length < 5 || questions.length > 15) return DEFAULT_QUESTIONS;
+    const validCat = ['scope','persona','process','people','gap','failure','source'];
+    return questions.filter(q => q && (q.text||q.question||q.question_text||q.content||'')).map((q,i) => ({ qid: q.qid || `Q-${i+1}`, category: validCat.includes(q.category) ? q.category : 'gap', text: q.text || q.question || q.question_text || q.content }));
+  } catch (e) { console.error(`OpenRouter exception: ${e.message}`); return DEFAULT_QUESTIONS; }
 }
 
 Deno.serve(async (req: Request) => {
-  // Only accept POST
-  if (req.method !== 'POST') {
-    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
-      status: 405,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } });
   }
-
+  if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
   try {
     const body = await req.json();
-    const projectId: string = body.project_id;
-    const apiKeyOverride: string | undefined = body.api_key;
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') || '';
+    const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SERVICE_KEY') || '';
+    if (!supabaseUrl || !serviceKey) return json({ error: 'Server config error' }, 500);
 
-    if (!projectId) {
-      return new Response(JSON.stringify({ error: 'Missing project_id' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
+    // CREATE MODE: create project + fire AI in background
+    if (body.create) {
+      const seed = (body.seed || '').trim();
+      if (seed.length < 5) return json({ error: 'Seed too short' }, 400);
+      const name = seed.substring(0, 40);
+      const createResp = await fetch(`${supabaseUrl}/rest/v1/chop_projects`, {
+        method: 'POST', headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
+        body: JSON.stringify({ name, seed, questions: [], status: 'generating' }),
       });
+      if (!createResp.ok) return json({ error: 'Failed to create project' }, 500);
+      const p = (await createResp.json())?.[0];
+      if (!p?.id) return json({ error: 'No project ID' }, 500);
+      (async () => {
+        try {
+          const apiKey = await getOpenRouterKey(supabaseUrl, serviceKey);
+          if (!apiKey) return;
+          const questions = await generateQuestions(seed, apiKey);
+          await fetch(`${supabaseUrl}/rest/v1/chop_projects?id=eq.${p.id}`, {
+            method: 'PATCH', headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation,missing=default' },
+            body: JSON.stringify({ questions, status: 'questions_generated', updated_at: new Date().toISOString() }),
+          });
+        } catch (e) { console.error(`BG gen failed ${p.id}: ${e.message}`); }
+      })();
+      return json({ success: true, id: p.id, status: 'generating' });
     }
 
-    // Get env variables from request headers or deno env
-    const supabaseUrl = req.headers.get('X-SUPABASE-URL') || Deno.env.get('SUPABASE_URL') || '';
-    const supabaseServiceKey = req.headers.get('X-SUPABASE-SERVICE-KEY') || Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || Deno.env.get('SUPABASE_SERVICE_KEY') || '';
-
-    if (!supabaseUrl || !supabaseServiceKey) {
-      console.error('Missing Supabase credentials');
-      return new Response(JSON.stringify({ error: 'Server configuration error' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Fetch the project
-    const projectResp = await fetch(
-      `${supabaseUrl}/rest/v1/chop_projects?id=eq.${projectId}&select=*`,
-      {
-        headers: {
-          'apikey': supabaseServiceKey,
-          'Authorization': `Bearer ${supabaseServiceKey}`,
-        },
-      }
-    );
-
-    if (!projectResp.ok) {
-      console.error(`Failed to fetch project: ${projectResp.status}`);
-      return new Response(JSON.stringify({ error: 'Project not found' }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
-    const projects = await projectResp.json();
-    const project = projects?.[0];
-    if (!project) {
-      return new Response(JSON.stringify({ error: 'Project not found' }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Get OpenRouter API key
-    const apiKey = apiKeyOverride || await getOpenRouterKey(supabaseUrl, supabaseServiceKey);
-    if (!apiKey) {
-      console.error('Could not get OpenRouter API key — using defaults');
-    }
-
-    // Generate questions
-    const questions = apiKey
-      ? await generateQuestions(project.seed, apiKey)
-      : DEFAULT_QUESTIONS;
-
-    // Save questions to the project
-    const updateResp = await fetch(
-      `${supabaseUrl}/rest/v1/chop_projects?id=eq.${projectId}`,
-      {
-        method: 'PATCH',
-        headers: {
-          'apikey': supabaseServiceKey,
-          'Authorization': `Bearer ${supabaseServiceKey}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=representation',
-        },
-        body: JSON.stringify({
-          questions: questions,
-          status: 'questions_generated',
-          updated_at: new Date().toISOString(),
-        }),
-      }
-    );
-
-    if (!updateResp.ok) {
-      const errText = await updateResp.text();
-      console.error(`Failed to update project: ${updateResp.status} ${errText}`);
-      return new Response(JSON.stringify({
-        error: 'Failed to save questions',
-        questions_generated: questions.length,
-        using_defaults: questions === DEFAULT_QUESTIONS,
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
-    console.log(`Generated ${questions.length} questions for project ${projectId}`);
-    return new Response(JSON.stringify({
-      success: true,
-      project_id: projectId,
-      questions_count: questions.length,
-      using_defaults: questions === DEFAULT_QUESTIONS,
-    }), {
-      headers: { 'Content-Type': 'application/json' },
+    // LEGACY MODE: generate for existing project
+    if (!body.project_id) return json({ error: 'Missing project_id' }, 400);
+    const projectResp = await fetch(`${supabaseUrl}/rest/v1/chop_projects?id=eq.${body.project_id}&select=seed`,
+      { headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}` } });
+    if (!projectResp.ok) return json({ error: 'Project not found' }, 404);
+    const proj = (await projectResp.json())?.[0];
+    if (!proj) return json({ error: 'Project not found' }, 404);
+    const apiKey = await getOpenRouterKey(supabaseUrl, serviceKey);
+    const questions = apiKey ? await generateQuestions(proj.seed, apiKey) : DEFAULT_QUESTIONS;
+    await fetch(`${supabaseUrl}/rest/v1/chop_projects?id=eq.${body.project_id}`, {
+      method: 'PATCH', headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation,missing=default' },
+      body: JSON.stringify({ questions, status: 'questions_generated', updated_at: new Date().toISOString() }),
     });
-  } catch (e: any) {
-    console.error(`Unhandled error: ${e.message}`);
-    return new Response(JSON.stringify({ error: e.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
+    return json({ success: true, project_id: body.project_id, questions_count: questions.length });
+  } catch (e) { return json({ error: e.message }, 500); }
 });

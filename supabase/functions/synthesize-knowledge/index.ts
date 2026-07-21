@@ -1,7 +1,23 @@
 // Chop: Synthesize Knowledge Edge Function
 // Called asynchronously after experts have answered.
 // Fetches all answers for a project, calls OpenRouter, saves result.
+// Produces a proper OKF v0.2 bundle with:
+//   index.md, log.md, okf.yaml, synthesis.md, concepts/*.md, raw/answers.md, raw/seed.md
+// All files use OKF frontmatter, [[wikilinks]] cross-references, and preserve raw answers.
 // Deno runtime — no 30s Worker CPU limit, no 20s timeout.
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+const DEFAULT_AI_MODEL = 'openai/gpt-4o';
+const OKF_VERSION = '0.2';
+
+const SYSTEM_PROMPT = `You are an expert knowledge synthesizer. Given raw expert interview answers about a topic, produce a coherent, structured knowledge document.
+Identify consensus statements, flag divergences or disagreements, highlight uncertainty, and extract actionable takeaways.
+Output valid markdown. Be thorough but concise.
+CRITICAL: Do NOT simply repeat the raw answers. Synthesize them. Group related ideas, identify patterns, and flag contradictions.
+Use headers, bullet points, and **bold** for emphasis. Do NOT wrap in code fences.`;
+
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 interface Env {
   SUPABASE_URL: string;
@@ -42,15 +58,17 @@ interface Question {
 }
 
 // Category display names
-const CATEGORY_META: Record<string, { title: string; description: string }> = {
-  scope:     { title: 'Scope',     description: 'Boundaries, systems, tools, and coverage areas.' },
-  persona:   { title: 'Persona',   description: 'Who needs this knowledge and what they need.' },
-  process:   { title: 'Process',   description: 'Core workflow steps, tools, and permissions.' },
-  people:    { title: 'People',    description: 'Key people, roles, and ownership.' },
-  gap:       { title: 'Gap',       description: 'What is undocumented or poorly understood.' },
-  failure:   { title: 'Failure',   description: 'Common mistakes and failure points.' },
-  source:    { title: 'Source',    description: 'Authoritative sources of truth.' },
+const CATEGORY_META: Record<string, { title: string; description: string; plural: string }> = {
+  scope:   { title: 'Scope',     description: 'Boundaries, systems, tools, and coverage areas.',        plural: 'scope' },
+  persona: { title: 'Persona',   description: 'Who needs this knowledge and what they need.',           plural: 'personas' },
+  process: { title: 'Process',   description: 'Core workflow steps, tools, and permissions.',          plural: 'processes' },
+  people:  { title: 'People',    description: 'Key people, roles, and ownership.',                      plural: 'people' },
+  gap:     { title: 'Gap',       description: 'What is undocumented or poorly understood.',             plural: 'gaps' },
+  failure: { title: 'Failure',   description: 'Common mistakes and failure points.',                    plural: 'failures' },
+  source:  { title: 'Source',    description: 'Authoritative sources of truth.',                        plural: 'sources' },
 };
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function escYaml(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
@@ -58,18 +76,6 @@ function escYaml(s: string): string {
 
 function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-async function getOpenRouterKey(supabaseUrl: string, serviceKey: string): Promise<string | null> {
-  try {
-    const resp = await fetch(
-      `${supabaseUrl}/rest/v1/chop_config?key=eq.openrouter_api_key&select=value`,
-      { headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}` } }
-    );
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    return data?.[0]?.value || null;
-  } catch { return null; }
 }
 
 function confidenceLevel(answers: { answered: number }[]): string {
@@ -80,63 +86,150 @@ function confidenceLevel(answers: { answered: number }[]): string {
   return 'none';
 }
 
-// Build the main synthesis markdown document
-async function synthesizeMarkdown(
-  projectName: string,
-  seed: string,
-  experts: Expert[],
-  questions: Question[],
-  allAnswers: Answer[],
-  apiKey: string
-): Promise<string> {
-  const respondents = experts.filter(e => e.answered > 0);
+async function getOpenRouterKey(supabaseUrl: string, serviceKey: string): Promise<string | null> {
+  // Try env first (set as Supabase Edge Function secret) — fastest path
+  const envKey = Deno.env.get('OPENROUTER_API_KEY');
+  if (envKey) return envKey;
+
+  try {
+    // Refresh schema cache first
+    await fetch(`${supabaseUrl}/rest/v1/rpc/refresh_schema_cache`, {
+      method: 'POST',
+      headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/chop_config?key=eq.openrouter_api_key&select=value`,
+      { headers: { 'apikey': serviceKey, 'Authorization': `Bearer ${serviceKey}` } }
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data?.[0]?.value || null;
+  } catch { return null; }
+}
+
+// ─── AI Synthesis ────────────────────────────────────────────────────────────
+
+interface GroupedAnswer {
+  qid: string;
+  q: string;
+  category: string;
+  answers: { name: string; a: string }[];
+}
+
+function groupAnswers(allAnswers: Answer[], experts: Expert[], questions: Question[]): {
+  groups: GroupedAnswer[];
+  byCategory: Record<string, GroupedAnswer[]>;
+  qidToCategory: Map<string, string>;
+  expertMap: Map<string, string>;
+  respondents: Expert[];
+} {
   const expertMap = new Map<string, string>();
   experts.forEach(e => expertMap.set(e.id, e.name));
 
-  // Group answers by question
-  const byQid = new Map<string, { qid: string; q: string; answers: { name: string; a: string }[] }>();
+  const qidToCategory = new Map<string, string>();
+  questions.forEach(q => qidToCategory.set(q.qid, q.category));
+
+  const byQid = new Map<string, GroupedAnswer>();
   for (const a of allAnswers) {
     if (!a.answer || a.skipped) continue;
     const name = expertMap.get(a.expert_id) || 'Unknown';
     let g = byQid.get(a.question_id);
     if (!g) {
-      g = { qid: a.question_id, q: a.question_text, answers: [] };
+      g = { qid: a.question_id, q: a.question_text, category: qidToCategory.get(a.question_id) || 'uncategorized', answers: [] };
       byQid.set(a.question_id, g);
     }
     g.answers.push({ name, a: a.answer });
   }
 
   const groups = Array.from(byQid.values());
-  const qidToCategory = new Map<string, string>();
-  questions.forEach(q => qidToCategory.set(q.qid, q.category));
 
-  const byCategory: Record<string, typeof groups> = {};
+  const byCategory: Record<string, GroupedAnswer[]> = {};
   for (const g of groups) {
-    const cat = qidToCategory.get(g.qid) || 'uncategorized';
+    const cat = g.category;
     if (!byCategory[cat]) byCategory[cat] = [];
     byCategory[cat].push(g);
   }
 
-  // Build answer blocks for the prompt
-  let answerBlocks = '';
+  const respondents = experts.filter(e => e.answered > 0);
+
+  return { groups, byCategory, qidToCategory, expertMap, respondents };
+}
+
+function buildAnswerBlocks(groups: GroupedAnswer[]): string {
+  let blocks = '';
   for (const g of groups) {
-    const cat = qidToCategory.get(g.qid) || 'uncategorized';
-    answerBlocks += `## Question: ${g.q}\n`;
-    answerBlocks += `QID: ${g.qid} | Category: ${cat}\n`;
+    blocks += `## Question: ${g.q}\n`;
+    blocks += `QID: ${g.qid} | Category: ${g.category}\n`;
     for (const a of g.answers) {
-      answerBlocks += `- **${a.name}**: ${a.a}\n`;
+      blocks += `- **${a.name}**: ${a.a}\n`;
     }
-    answerBlocks += '\n';
+    blocks += '\n';
   }
+  return blocks;
+}
 
-  const now = new Date();
-  const dateStr = now.toISOString().slice(0, 10);
+async function callAI(
+  systemPrompt: string,
+  userPrompt: string,
+  apiKey: string,
+  model: string = DEFAULT_AI_MODEL,
+): Promise<string | null> {
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://chop-mvp.cloudflare-rake998.workers.dev',
+        'X-Title': 'Chop MVP',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 4000,
+      }),
+    });
 
-  const systemPrompt = `You are an expert knowledge synthesizer. Given raw expert interview answers about a topic, produce a coherent, structured knowledge document.
-Identify consensus statements, flag divergences or disagreements, highlight uncertainty, and extract actionable takeaways.
-Output valid markdown. Be thorough but concise.
-CRITICAL: Do NOT simply repeat the raw answers. Synthesize them. Group related ideas, identify patterns, and flag contradictions.
-Use headers, bullet points, and **bold** for emphasis. Do NOT wrap in code fences.`;
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(`OpenRouter returned ${response.status}: ${text}`);
+      return null;
+    }
+
+    const data: OpenRouterResponse = await response.json();
+    let content = data.choices?.[0]?.message?.content;
+    if (!content) return null;
+
+    content = content.trim();
+    // Strip code fences if present
+    if (content.startsWith('```markdown')) content = content.slice(12);
+    else if (content.startsWith('```json')) content = content.slice(7);
+    else if (content.startsWith('```yaml')) content = content.slice(7);
+    else if (content.startsWith('```')) content = content.slice(3);
+    if (content.endsWith('```')) content = content.slice(0, -3);
+    return content.trim();
+  } catch (e: any) {
+    console.error(`OpenRouter exception: ${e.message}`);
+    return null;
+  }
+}
+
+// ─── Synthesis Markdown Generation ──────────────────────────────────────────
+
+async function synthesizeMarkdown(
+  projectName: string,
+  seed: string,
+  groups: GroupedAnswer[],
+  byCategory: Record<string, GroupedAnswer[]>,
+  respondents: Expert[],
+  apiKey: string,
+): Promise<string> {
+  const answerBlocks = buildAnswerBlocks(groups);
 
   const userPrompt = `Synthesize the following expert answers into a structured knowledge document.
 
@@ -155,56 +248,20 @@ Produce a markdown document with the following sections:
 
 Format: clean markdown with headers. Be analytical — don't just summarize, actually synthesize. Flag specific expert names when they hold unique knowledge. Do NOT wrap the entire output in a code fence.`;
 
-  try {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://chop-mvp.cloudflare-rake998.workers.dev',
-        'X-Title': 'Chop MVP',
-      },
-      body: JSON.stringify({
-        model: 'openai/gpt-4o',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        temperature: 0.7,
-        max_tokens: 4000,
-      }),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      console.error(`Synthesis OpenRouter returned ${response.status}: ${text}`);
-      return buildFallbackMarkdown(projectName, seed, respondents, groups, byCategory, qidToCategory, dateStr);
-    }
-
-    const data: OpenRouterResponse = await response.json();
-    let content = data.choices?.[0]?.message?.content;
-    if (!content) return buildFallbackMarkdown(projectName, seed, respondents, groups, byCategory, qidToCategory, dateStr);
-
-    content = content.trim();
-    if (content.startsWith('```markdown')) content = content.slice(12);
-    else if (content.startsWith('```')) content = content.slice(3);
-    if (content.endsWith('```')) content = content.slice(0, -3);
-    return content.trim();
-  } catch (e: any) {
-    console.error(`Synthesis OpenRouter exception: ${e.message}`);
-    return buildFallbackMarkdown(projectName, seed, respondents, groups, byCategory, qidToCategory, dateStr);
-  }
+  const content = await callAI(SYSTEM_PROMPT, userPrompt, apiKey);
+  if (content) return content;
+  return buildFallbackMarkdown(projectName, seed, respondents, groups, byCategory);
 }
 
 function buildFallbackMarkdown(
   projectName: string,
   seed: string,
   respondents: Expert[],
-  groups: { qid: string; q: string; answers: { name: string; a: string }[] }[],
-  byCategory: Record<string, typeof groups>,
-  qidToCategory: Map<string, string>,
-  dateStr: string
+  groups: GroupedAnswer[],
+  byCategory: Record<string, GroupedAnswer[]>,
 ): string {
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
   let md = `# ${projectName} - Context Summary\n\n`;
   md += '> **Note:** AI synthesis was unavailable. This is a structured fallback document.\n\n';
   md += '## Metadata\n';
@@ -220,7 +277,6 @@ function buildFallbackMarkdown(
     const meta = CATEGORY_META[cat];
     if (!catAnswers || catAnswers.length === 0) continue;
     md += `### ${meta.title}\n\n`;
-    const conf = catAnswers.filter(() => true);
     md += `*Confidence: ${confidenceLevel(respondents)}*\n\n`;
     for (const q of catAnswers) {
       md += `**${q.q}** (QID: ${q.qid})\n\n`;
@@ -235,244 +291,282 @@ function buildFallbackMarkdown(
   return md;
 }
 
-// Build the OKF bundle JSON (per-category summaries)
-async function buildBundleJson(
-  seed: string,
-  questions: Question[],
-  allAnswers: Answer[],
-  experts: Expert[],
-  apiKey: string
-): Promise<Record<string, any> | null> {
-  const expertMap = new Map<string, string>();
-  experts.forEach(e => expertMap.set(e.id, e.name));
+// ─── OKF Bundle Builder ──────────────────────────────────────────────────────
 
-  const byQid = new Map<string, { qid: string; q: string; answers: { name: string; a: string }[] }>();
-  for (const a of allAnswers) {
-    if (!a.answer || a.skipped) continue;
-    const name = expertMap.get(a.expert_id) || 'Unknown';
-    let g = byQid.get(a.question_id);
-    if (!g) {
-      g = { qid: a.question_id, q: a.question_text, answers: [] };
-      byQid.set(a.question_id, g);
-    }
-    g.answers.push({ name, a: a.answer });
-  }
-
-  let answerBlocks = '';
-  for (const [_, g] of byQid) {
-    answerBlocks += `## Question: ${g.q}\n`;
-    answerBlocks += `QID: ${g.qid}\n`;
-    for (const a of g.answers) {
-      answerBlocks += `- **${a.name}**: ${a.a}\n`;
-    }
-    answerBlocks += '\n';
-  }
-
-  try {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://chop-mvp.cloudflare-rake998.workers.dev',
-        'X-Title': 'Chop MVP',
-      },
-      body: JSON.stringify({
-        model: 'openai/gpt-4o',
-        messages: [
-          { role: 'system', content: 'You produce structured JSON summaries from expert answers. Output ONLY valid JSON.' },
-          { role: 'user', content: `Based on the expert answers below, produce a structured JSON output with per-category summaries.
-The JSON must have this exact structure:
-{
-  "category_summaries": {
-    "scope": {"summary": "...", "consensus": ["..."], "divergence": ["..."], "takeaways": ["..."]},
-    "persona": {...},
-    ... only categories that have answers ...
-  },
-  "index_summary": "2-3 sentence bundle overview",
-  "log_notes": "1-2 sentences on what was captured"
-}
-
-Expert answers:
-${answerBlocks}
-
-Output ONLY the JSON object. No markdown fences, no commentary.` },
-        ],
-        temperature: 0.5,
-        max_tokens: 3000,
-      }),
-    });
-
-    if (!response.ok) return null;
-    const data: OpenRouterResponse = await response.json();
-    let content = data.choices?.[0]?.message?.content;
-    if (!content) return null;
-
-    content = content.trim();
-    if (content.startsWith('```json')) content = content.slice(7);
-    else if (content.startsWith('```')) content = content.slice(3);
-    if (content.endsWith('```')) content = content.slice(0, -3);
-    return JSON.parse(content.trim());
-  } catch {
-    return null;
-  }
-}
-
-function buildBundle(
+function buildOkfBundle(
   projectName: string,
   seed: string,
   experts: Expert[],
   questions: Question[],
   allAnswers: Answer[],
+  groups: GroupedAnswer[],
+  byCategory: Record<string, GroupedAnswer[]>,
+  respondents: Expert[],
   markdown: string,
-  bundleJson: Record<string, any> | null
 ): Record<string, string> {
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const timestamp = now.toISOString();
 
-  const qidToCategory = new Map<string, string>();
-  questions.forEach(q => qidToCategory.set(q.qid, q.category));
-
-  const byCategory: Record<string, { qid: string; q: string; answers: { name: string; a: string }[] }[]> = {};
-  for (const a of allAnswers) {
-    if (!a.answer || a.skipped) continue;
-    const cat = qidToCategory.get(a.question_id) || 'uncategorized';
-    if (!byCategory[cat]) byCategory[cat] = [];
-    // Group by question within category
-  }
-
-  // Re-group properly
-  const byQid = new Map<string, { qid: string; q: string; answers: { name: string; a: string }[] }>();
-  const expertMap = new Map<string, string>();
-  experts.forEach(e => expertMap.set(e.id, e.name));
-  for (const a of allAnswers) {
-    if (!a.answer || a.skipped) continue;
-    const name = expertMap.get(a.expert_id) || 'Unknown';
-    let g = byQid.get(a.question_id);
-    if (!g) {
-      g = { qid: a.question_id, q: a.question_text, answers: [] };
-      byQid.set(a.question_id, g);
-    }
-    g.answers.push({ name, a: a.answer });
-  }
-
-  const catQids: Record<string, { qid: string; q: string; answers: { name: string; a: string }[] }[]> = {};
-  for (const [qid, g] of byQid) {
-    const cat = qidToCategory.get(qid) || 'uncategorized';
-    if (!catQids[cat]) catQids[cat] = [];
-    catQids[cat].push(g);
-  }
-
-  const respondents = experts.filter(e => e.answered > 0);
-  const bundle: Record<string, string> = {};
   const catKeys = Object.keys(CATEGORY_META);
+  const answeredCategories = catKeys.filter(cat => byCategory[cat]?.length > 0);
+  const bundle: Record<string, string> = {};
 
-  // Build concept files
-  for (const cat of catKeys) {
+  // Helper to build wikilinks for a category
+  function conceptLinks(excludeCategory: string): string[] {
+    const links: string[] = [];
+    for (const cat of answeredCategories) {
+      if (cat === excludeCategory) continue;
+      const meta = CATEGORY_META[cat];
+      links.push(`[[concepts/${cat}.md|${meta.title}]]`);
+    }
+    return links;
+  }
+
+  // ── 1. okf.yaml ──────────────────────────────────────────────────────────
+  bundle['okf.yaml'] = [
+    '---',
+    'okf_version: "' + OKF_VERSION + '"',
+    'type: KnowledgeBundle',
+    'title: "' + escYaml(projectName) + '"',
+    'description: "Chop-captured knowledge about: ' + escYaml(seed) + '"',
+    'tags: [chop, knowledge-capture, bundle]',
+    'timestamp: ' + timestamp,
+    'source: "' + escYaml(seed) + '"',
+    'manifest:',
+    '  files:',
+    '    - index.md',
+    '    - log.md',
+    '    - okf.yaml',
+    '    - synthesis.md',
+    answeredCategories.map(cat => '    - concepts/' + cat + '.md').join('\n'),
+    '    - raw/answers.md',
+    '    - raw/seed.md',
+    '---',
+    '',
+  ].join('\n');
+
+  // ── 2. index.md ──────────────────────────────────────────────────────────
+  {
+    let body = '---\n';
+    body += 'type: KnowledgeBundle\n';
+    body += 'title: "' + escYaml(projectName) + '"\n';
+    body += 'description: "Chop-captured knowledge generated from expert interviews about: ' + escYaml(seed) + '"\n';
+    body += 'tags: [chop, knowledge-capture, bundle]\n';
+    body += 'timestamp: ' + timestamp + '\n';
+    body += 'okf_version: "' + OKF_VERSION + '"\n';
+    body += 'source: "' + escYaml(seed) + '"\n';
+    body += '---\n\n';
+    body += '# ' + projectName + '\n\n';
+    body += 'Captured on ' + dateStr + ' via **Chop** — an interview-loop knowledge capture tool.\n\n';
+    body += 'See the [[synthesis.md|AI Synthesis]] for an executive summary of findings.\n\n';
+    body += '## Metadata\n\n';
+    body += '- **Seed:** ' + seed + '\n';
+    body += '- **OKF Version:** ' + OKF_VERSION + '\n';
+    body += '- **Respondents:** ' + respondents.map(e => e.name).join(', ') + '\n';
+    body += '- **Questions Answered:** ' + allAnswers.filter(a => !a.skipped && a.answer).length + '\n';
+    body += '- **Categories:** ' + answeredCategories.length + '\n';
+    body += '- **Generated:** ' + timestamp + '\n\n';
+    body += '## Concepts\n\n';
+    body += '| Category | Description | Questions |\n';
+    body += '|----------|-------------|-----------|\n';
+    for (const cat of answeredCategories) {
+      const meta = CATEGORY_META[cat];
+      const count = byCategory[cat].length;
+      body += '| [[' + meta.title + '|concepts/' + cat + '.md]] | ' + meta.description + ' | ' + count + ' |\n';
+    }
+    body += '\n## Bundle Contents\n\n';
+    body += '- [[synthesis.md|AI Synthesis]] — Executive summary and cross-category insights\n';
+    for (const cat of answeredCategories) {
+      const meta = CATEGORY_META[cat];
+      body += '  - [[concepts/' + cat + '.md|' + meta.title + ']] — ' + meta.description + '\n';
+    }
+    body += '- [[raw/answers.md|Raw Answers]] — All expert question/answer pairs verbatim\n';
+    body += '- [[raw/seed.md|Original Seed]] — The seed topic used to generate questions\n';
+    body += '- [[log.md|Capture Log]] — Session metadata and contributor records\n';
+    body += '- [[okf.yaml|OKF Manifest]] — Bundle manifest\n\n';
+    body += '## Contributors\n\n';
+    for (const r of respondents) body += '- ' + r.name + '\n';
+    bundle['index.md'] = body;
+  }
+
+  // ── 3. log.md ────────────────────────────────────────────────────────────
+  {
+    let body = '---\n';
+    body += 'type: Log\n';
+    body += 'title: "Capture Log — ' + escYaml(projectName) + '"\n';
+    body += 'tags: [chop, log]\n';
+    body += 'timestamp: ' + timestamp + '\n';
+    body += 'okf_version: "' + OKF_VERSION + '"\n';
+    body += '---\n\n';
+    body += '# Capture Log\n\n';
+    body += 'Part of the [[index.md|Knowledge Bundle]] for **' + projectName + '**.\n\n';
+    body += '## Session Summary\n\n';
+    body += '- **Date:** ' + dateStr + '\n';
+    body += '- **Creation:** Bundle created from Chop interview-loop capture session.\n';
+    body += '- **Seed:** "' + seed + '"\n';
+    body += '- **Respondents:** ' + respondents.length + ' expert' + (respondents.length !== 1 ? 's' : '') + ' contributed.\n';
+    body += '- **Total answers:** ' + allAnswers.filter(a => !a.skipped && a.answer).length + '\n';
+    body += '- **Categories captured:** ' + answeredCategories.map(c => CATEGORY_META[c].title).join(', ') + '\n\n';
+    body += '## Respondent Details\n\n';
+    body += '| Name | Questions Answered |\n';
+    body += '|------|-------------------|\n';
+    for (const r of respondents) {
+      body += '| ' + r.name + ' | ' + r.answered + ' |\n';
+    }
+    bundle['log.md'] = body;
+  }
+
+  // ── 4. synthesis.md ──────────────────────────────────────────────────────
+  {
+    let body = '---\n';
+    body += 'type: Synthesis\n';
+    body += 'title: "AI Synthesis — ' + escYaml(projectName) + '"\n';
+    body += 'description: "AI-generated synthesis of expert interview answers for: ' + escYaml(seed) + '"\n';
+    body += 'tags: [chop, synthesis, ai-generated]\n';
+    body += 'timestamp: ' + timestamp + '\n';
+    body += 'okf_version: "' + OKF_VERSION + '"\n';
+    body += 'source: "' + escYaml(seed) + '"\n';
+    body += '---\n\n';
+    body += '# AI Synthesis\n\n';
+    body += '> **Bundle:** [[index.md|' + projectName + ']] | **Raw Data:** [[raw/answers.md|Raw Answers]] | **Log:** [[log.md|Capture Log]]\n\n';
+    // Strip the outer heading if markdown starts with one
+    let synthBody = markdown;
+    // Link concept files within the synthesis text
+    for (const cat of answeredCategories) {
+      const meta = CATEGORY_META[cat];
+      // Add wikilinks after first mention of each category title
+      const regex = new RegExp('\\b' + meta.title + '\\b', 'g');
+      synthBody = synthBody.replace(regex, '[[' + meta.title + '|concepts/' + cat + '.md]]');
+    }
+    body += synthBody + '\n\n';
+    body += '---\n';
+    body += '*Synthesis generated via OpenRouter (' + DEFAULT_AI_MODEL + ') at ' + timestamp + '.*\n';
+    bundle['synthesis.md'] = body;
+  }
+
+  // ── 5. concepts/*.md ─────────────────────────────────────────────────────
+  for (const cat of answeredCategories) {
     const meta = CATEGORY_META[cat];
-    const catAnswers = catQids[cat];
-    if (!catAnswers) continue;
-    const fileName = `${cat}.md`;
+    const catAnswers = byCategory[cat];
+    const otherLinks = conceptLinks(cat);
 
     let body = '---\n';
-    body += `type: Concept\n`;
-    body += `title: ${meta.title} — ${projectName}\n`;
-    body += `description: ${escYaml(meta.description)}\n`;
-    body += `tags: [chop, knowledge-capture, ${cat}]\n`;
-    body += `timestamp: ${timestamp}\n`;
-    body += `source: "${escYaml(seed)}"\n`;
-    body += `---\n\n`;
-    body += `# ${meta.title}\n\n`;
-    body += `${meta.description}\n\n`;
-    body += `Part of the **[Knowledge Bundle](./index.md)** for *${projectName}*.\n\n`;
-    body += `**Confidence:** ${confidenceLevel(respondents)}\n\n`;
+    body += 'type: Concept\n';
+    body += 'title: "' + meta.title + ' — ' + escYaml(projectName) + '"\n';
+    body += 'description: "' + escYaml(meta.description) + '"\n';
+    body += 'tags: [chop, knowledge-capture, ' + cat + ']\n';
+    body += 'timestamp: ' + timestamp + '\n';
+    body += 'okf_version: "' + OKF_VERSION + '"\n';
+    body += 'source: "' + escYaml(seed) + '"\n';
+    body += 'bundle: "[[index.md|' + escYaml(projectName) + ']]"\n';
+    body += '---\n\n';
+    body += '# ' + meta.title + '\n\n';
+    body += meta.description + '\n\n';
+    body += 'Part of the [[index.md|Knowledge Bundle]] for **' + projectName + '**.\n\n';
+    body += '**Confidence:** ' + confidenceLevel(respondents) + '\n\n';
 
-    if (bundleJson?.category_summaries?.[cat]) {
-      const cs = bundleJson.category_summaries[cat];
-      if (cs.summary) body += `## Summary\n\n${cs.summary}\n\n`;
-      if (cs.consensus?.length) body += `## Consensus\n\n${cs.consensus.map((c: string) => `- ${c}`).join('\n')}\n\n`;
-      if (cs.divergence?.length) body += `## Divergence\n\n${cs.divergence.map((d: string) => `- ${d}`).join('\n')}\n\n`;
-      if (cs.takeaways?.length) body += `## Takeaways\n\n${cs.takeaways.map((t: string) => `- ${t}`).join('\n')}\n\n`;
-    } else {
-      body += '## Answers\n\n';
+    // Write each question and its answers
+    body += '## Answers\n\n';
+    for (const q of catAnswers) {
+      body += '### ' + q.q + '\n\n';
+      body += '> **Question ID:** ' + q.qid + '\n\n';
+      for (const a of q.answers) {
+        body += '<details>\n';
+        body += '<summary><strong>' + escHtml(a.name) + '</strong> answered:</summary>\n\n';
+        body += a.a + '\n\n';
+        body += '</details>\n\n';
+      }
+      body += '---\n\n';
+    }
+
+    // Cross-references
+    body += '## Related Concepts\n\n';
+    body += '- [[index.md|Back to Bundle Index]]\n';
+    for (const link of otherLinks) {
+      body += '- ' + link + '\n';
+    }
+    body += '- [[raw/answers.md|Raw Answers]]\n';
+    body += '- [[synthesis.md|AI Synthesis]]\n\n';
+
+    body += '## Contributors\n\n';
+    for (const r of respondents) body += '- ' + r.name + '\n';
+
+    bundle['concepts/' + cat + '.md'] = body;
+  }
+
+  // ── 6. raw/answers.md ────────────────────────────────────────────────────
+  {
+    let body = '---\n';
+    body += 'type: RawData\n';
+    body += 'title: "Raw Expert Answers — ' + escYaml(projectName) + '"\n';
+    body += 'description: "Verbatim expert question/answer pairs for: ' + escYaml(seed) + '"\n';
+    body += 'tags: [chop, raw-data, answers]\n';
+    body += 'timestamp: ' + timestamp + '\n';
+    body += 'okf_version: "' + OKF_VERSION + '"\n';
+    body += 'source: "' + escYaml(seed) + '"\n';
+    body += '---\n\n';
+    body += '# Raw Expert Answers\n\n';
+    body += '> This file contains the original, unmodified question/answer pairs collected during the Chop interview loop.\n';
+    body += '> See [[synthesis.md|AI Synthesis]] for the synthesized analysis, or [[index.md|Bundle Index]] for the full table of contents.\n\n';
+
+    // Group by category for readability
+    for (const cat of answeredCategories) {
+      const meta = CATEGORY_META[cat];
+      const catAnswers = byCategory[cat];
+      body += '## ' + meta.title + '\n\n';
+      body += 'See also: [[concepts/' + cat + '.md|' + meta.title + ' Concept]]\n\n';
       for (const q of catAnswers) {
-        body += `### ${q.q}\n\n`;
-        body += `> **Question ID:** ${q.qid}\n\n`;
+        body += '### Question: ' + q.q + '\n';
+        body += '- **QID:** ' + q.qid + '\n';
+        body += '- **Category:** ' + meta.title + '\n\n';
         for (const a of q.answers) {
-          body += `<details>\n<summary><strong>${escHtml(a.name)}</strong> answered:</summary>\n\n${a.a}\n\n</details>\n\n`;
+          body += '**' + a.name + ':**\n\n';
+          body += '> ' + a.a.replace(/\n/g, '\n> ') + '\n\n';
         }
         body += '---\n\n';
       }
     }
 
-    // Cross-links
-    body += '## Related\n\n';
-    body += '- [Back to Bundle Index](./index.md)\n';
-    for (const cl of catKeys) {
-      if (cl !== cat && catQids[cl]) {
-        body += `- [${CATEGORY_META[cl].title}](./${cl}.md)\n`;
+    bundle['raw/answers.md'] = body;
+  }
+
+  // ── 7. raw/seed.md ───────────────────────────────────────────────────────
+  {
+    let body = '---\n';
+    body += 'type: RawData\n';
+    body += 'title: "Original Seed — ' + escYaml(projectName) + '"\n';
+    body += 'description: "The seed topic used to generate questions for: ' + escYaml(seed) + '"\n';
+    body += 'tags: [chop, raw-data, seed]\n';
+    body += 'timestamp: ' + timestamp + '\n';
+    body += 'okf_version: "' + OKF_VERSION + '"\n';
+    body += 'source: "' + escYaml(seed) + '"\n';
+    body += '---\n\n';
+    body += '# Original Seed\n\n';
+    body += 'This bundle was generated from the following seed topic:\n\n';
+    body += '> ' + seed + '\n\n';
+    body += 'The seed was used by Chop\'s question generator to create targeted interview questions across ' + answeredCategories.length + ' categories.\n\n';
+    body += '## Generated Questions\n\n';
+    for (const cat of answeredCategories) {
+      const meta = CATEGORY_META[cat];
+      const catQs = questions.filter(q => q.category === cat);
+      if (catQs.length === 0) continue;
+      body += '### ' + meta.title + '\n\n';
+      for (const q of catQs) {
+        body += '- `' + q.qid + '` ' + q.text + '\n';
       }
+      body += '\n';
     }
-    body += '\n## Contributors\n\n';
-    for (const r of respondents) body += `- ${r.name}\n`;
+    body += '---\n';
+    body += 'See [[index.md|Bundle Index]] for the full table of contents.\n';
 
-    bundle[fileName] = body;
+    bundle['raw/seed.md'] = body;
   }
-
-  // Build index.md
-  const indexSummary = bundleJson?.index_summary || '';
-  let indexBody = '---\n';
-  indexBody += 'type: KnowledgeBundle\n';
-  indexBody += `title: ${escYaml(projectName)}\n`;
-  indexBody += `description: "Chop-captured knowledge generated from expert interviews about: ${escYaml(seed)}"\n`;
-  indexBody += 'tags: [chop, knowledge-capture, bundle]\n';
-  indexBody += `timestamp: ${timestamp}\n`;
-  indexBody += 'okf_version: "0.2"\n';
-  indexBody += `source: "${escYaml(seed)}"\n`;
-  indexBody += '---\n\n';
-  indexBody += `# ${projectName}\n\n`;
-  indexBody += `Captured on ${dateStr} via **Chop** — an interview-loop knowledge capture tool.\n\n`;
-  if (indexSummary) indexBody += `${indexSummary}\n\n`;
-  indexBody += '## Metadata\n\n';
-  indexBody += `- **Seed:** ${seed}\n`;
-  indexBody += `- **Respondents:** ${respondents.map(e => e.name).join(', ')}\n`;
-  indexBody += `- **Questions Answered:** ${allAnswers.filter(a => !a.skipped && a.answer).length}\n`;
-  indexBody += `- **Categories:** ${Object.keys(catQids).length}\n\n`;
-  indexBody += '## Concepts\n\n';
-  for (const icat of catKeys) {
-    const imeta = CATEGORY_META[icat];
-    const icount = (catQids[icat] || []).length;
-    indexBody += `- [${imeta.title}](${icat}.md) — ${imeta.description}`;
-    if (icount > 0) indexBody += ` (${icount} question${icount > 1 ? 's' : ''})`;
-    indexBody += '\n';
-  }
-  indexBody += '\n## Contributors\n\n';
-  for (const r of respondents) indexBody += `- ${r.name}\n`;
-  bundle['index.md'] = indexBody;
-
-  // Build log.md
-  const logNotes = bundleJson?.log_notes || '';
-  let logBody = '---\n';
-  logBody += 'type: Log\n';
-  logBody += `title: Capture Log — ${projectName}\n`;
-  logBody += 'tags: [chop, log]\n';
-  logBody += `timestamp: ${timestamp}\n`;
-  logBody += '---\n\n';
-  logBody += `# Capture Log\n\n`;
-  logBody += `## ${dateStr}\n`;
-  logBody += `* **Creation:** Bundle created from Chop capture session.\n`;
-  logBody += `* **Seed:** "${seed}"\n`;
-  logBody += `* **Respondents:** ${respondents.length} expert${respondents.length !== 1 ? 's' : ''} contributed.\n`;
-  logBody += `* **Total answers:** ${allAnswers.filter(a => !a.skipped && a.answer).length}\n`;
-  if (logNotes) logBody += `* **Notes:** ${logNotes}\n`;
-  for (const r of respondents) {
-    logBody += `* **${r.name}** completed ${r.answered} question${r.answered !== 1 ? 's' : ''}.\n`;
-  }
-  bundle['log.md'] = logBody;
 
   return bundle;
 }
+
+// ─── Main Handler ────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
   if (req.method !== 'POST') {
@@ -570,16 +664,24 @@ Deno.serve(async (req: Request) => {
       }
     );
 
-    // Run both AI calls in parallel (synthesis markdown + bundle JSON)
-    const [markdown, bundleJson] = await Promise.all([
-      synthesizeMarkdown(project.name, project.seed, experts, questions, allAnswers, apiKey),
-      buildBundleJson(project.seed, questions, allAnswers, experts, apiKey),
-    ]);
+    // Group all answers once, reused everywhere
+    const grouped = groupAnswers(allAnswers, experts, questions);
 
-    // Build the OKF bundle
-    const bundle = buildBundle(project.name, project.seed, experts, questions, allAnswers, markdown, bundleJson);
+    // Generate the AI synthesis markdown
+    const markdown = await synthesizeMarkdown(
+      project.name, project.seed,
+      grouped.groups, grouped.byCategory, grouped.respondents, apiKey,
+    );
 
-    // Save the result
+    // Build the OKF v0.2 bundle
+    const bundle = buildOkfBundle(
+      project.name, project.seed,
+      experts, questions, allAnswers,
+      grouped.groups, grouped.byCategory, grouped.respondents,
+      markdown,
+    );
+
+    // Save the result (same shape as before so frontend compatibility is preserved)
     const synthesisResult = { markdown, bundle };
 
     const updateResp = await fetch(

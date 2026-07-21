@@ -54,14 +54,16 @@ const CSS = '*{box-sizing:border-box;margin:0;padding:0}'+
 '.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:12px 20px;display:none;z-index:100}';
 
 function shell(body, title, extra) {
-  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+(title||'Chop')+'</title><style>'+CSS+'</style></head><body><div class="container">'+body+'</div><div id="toast" class="toast"></div><script>function showToast(msg,d){var t=document.getElementById("toast");t.textContent=msg;t.classList.add("show");setTimeout(function(){t.classList.remove("show")},d||3000)}'+(extra||'')+'</script></body></html>';
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script><title>' + escHtml(title||'Chop') + '</title><style>' + CSS + '</style></head><body><div class="container">' + body + '</div><div id="toast" class="toast"></div><script>function showToast(msg,d){var t=document.getElementById("toast");t.textContent=msg;t.classList.add("show");setTimeout(function(){t.classList.remove("show")},d||3000)}' +
+    'function escHtml(s){return(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}' +
+    (extra||'') + '</script></body></html>';
 }
 
 function authScript() {
   return 'var tok=sessionStorage.getItem("chop_token");' +
     'async function authFetch(u,o){if(!o)o={};o.headers=o.headers||{};if(tok)o.headers["Authorization"]="Bearer "+tok;return fetch(u,o)}' +
     'async function getMe(){try{var r=await authFetch("/auth/me");return await r.json()}catch(e){return{user:null}}}' +
-    'async function logout(){sessionStorage.removeItem("chop_token");window.location.href="/"}';
+    'async function logout(){sessionStorage.removeItem("chop_token");document.cookie="chop_token=; path=/; max-age=0; SameSite=Lax";window.location.href="/"}';
 }
 
 function navBar(user) {
@@ -116,7 +118,7 @@ async function homePage(req, env) {
       'if(projects.length===0){da.innerHTML+=\'<div class="card" style="text-align:center;padding:40px 0"><div style="color:#666;font-size:1rem">No projects yet.</div><div style="color:#555;font-size:0.85rem;margin-top:8px">Create your first project to capture knowledge.</div></div>\';return}' +
       'da.innerHTML+=projects.map(function(p){' +
       'var qc=p.questions?p.questions.length:0;' +
-      'return\'<div class="card project-card" style="cursor:pointer" onclick="window.location.href=\\\\\'/project/\'+p.id+\'\\\\\'">\' +' +
+      'return\'<div class="card project-card" style="cursor:pointer" data-url="/project/\'+p.id+\'" onclick="window.location.href=this.dataset.url">\' +' +
       '\'<div class="flex-between"><div><strong>\'+escHtml(p.name||"Untitled")+\'</strong><span class="tag" style="margin-left:8px">\'+escHtml(p.status||"draft")+\'</span></div>\' +' +
       '\'<span style="color:#666;font-size:0.8rem">\'+(p.created_at||"").slice(0,10)+\'</span></div>\' +' +
       '\'<div style="font-size:0.85rem;color:#888;margin-top:4px">\'+escHtml((p.seed||"").slice(0,100))+\'</div>\' +' +
@@ -126,7 +128,7 @@ async function homePage(req, env) {
       'function showNewProject(){document.getElementById("new-project-card").style.display="block";document.getElementById("new-project-btn").style.display="none"}' +
       'async function startProject(){var s=document.getElementById("seed").value.trim();if(!s){showToast("Enter a topic first");return}' +
             'var b=document.querySelector("#new-project-card .btn");b.disabled=true;b.textContent="Generating...";document.getElementById("status-msg").textContent="Please wait...";' +
-            'try{var r=await authFetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seed:s})});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");window.location.href="/project/"+d.id}catch(e){document.getElementById("status-msg").textContent="Error: "+e.message+". Try again or use a simpler seed.";showToast("Error: "+e.message)}' +
+            'try{var r=await authFetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seed:s})});var d=await r.json();if(!r.ok)throw new Error(d.error||"Failed");window.location.href="/project/"+d.id}catch(e){document.getElementById("status-msg").textContent="Error: "+e.message+". Try again.";showToast("Error: "+e.message)}' +
             'b.disabled=false;b.textContent="Generate Questions"}' +
       'loadDashboard();';
     return new Response(shell(body, 'Chop - Dashboard', extra), {headers:{'Content-Type':'text/html'}});
@@ -268,7 +270,7 @@ async function projectDetailPage(req, env, pid) {
     'async function loadProject(){' +
     'try{var r=await authFetch("/api/projects/"+PID);var p=await r.json();if(!r.ok)throw new Error(p.error||"Not found");renderProject(p)}catch(e){' +
     'document.getElementById("project-loading").textContent="Error: "+e.message}}' +
-    'function renderProject(p){' +
+    'function renderProject(p){var hasSynth=false;' +
     'if(p.status==="generating"){' +
     'document.getElementById("project-area").innerHTML=\'<div class="card" style="text-align:center;padding:40px 0"><div style="font-size:2rem;margin-bottom:12px">&#9203;</div><h2>Generating questions...</h2><p style="color:#888;margin-top:8px">AI is analyzing your seed topic and crafting targeted questions. This usually takes 5-15 seconds.</p></div>\';' +
     'if(!POLL_INTERVAL){POLL_INTERVAL=setInterval(function(){loadProject()},3000)};return}' +
@@ -277,10 +279,11 @@ async function projectDetailPage(req, env, pid) {
     'if(!POLL_INTERVAL){POLL_INTERVAL=setInterval(function(){loadProject()},3000)};return}' +
     'if(POLL_INTERVAL){clearInterval(POLL_INTERVAL);POLL_INTERVAL=null}' +
     'var a=document.getElementById("project-area");' +
+    'if(p.status==="synthesized"&&p.synthesis_result){hasSynth=true;var sr=p.synthesis_result}' +
     'var qh="";for(var i=0;i<p.questions.length;i++){var q=p.questions[i];' +
     'qh+=\'<div style="padding:8px 0;border-bottom:1px solid #2a2a2a;display:flex;align-items:flex-start;gap:8px"><input type="checkbox" checked id="q-\'+i+\'" style="width:auto;margin-top:4px">\'' +
     '+\'<div><span class="q-badge">\'+q.qid+\'</span> <span class="tag \'+q.category+\'">\'+q.category+\'</span><div style="margin-top:4px;color:#ccc;font-size:0.9rem">\'+escHtml(q.text)+\'</div></div></div>\'}' +
-    'a.innerHTML=\'<div class="flex-between" style="margin-bottom:16px"><div><a href="/" style="color:#888;text-decoration:none;font-size:0.85rem">&larr; Back to Projects</a><h2 style="margin-top:4px">\'+escHtml(p.name)+\'</h2><div class="sub" style="margin-bottom:0">\'+escHtml(p.seed.slice(0,150))+\'</div></div><span class="tag">\'+escHtml(p.status)+\'</span></div>\'+\'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><label style="margin-bottom:0;font-size:1rem">Questions (\'+p.questions.length+\')</label></div><div id="q-list">\'+qh+\'</div></div>\'+\'<div class="card"><label style="font-size:1rem">Add Experts</label><div style="margin-bottom:12px"><div class="expert-input-row"><input id="expert-name" placeholder="Name (e.g. Alice - Data Eng)" style="margin-bottom:0"><input id="expert-email" placeholder="Email (optional)" style="margin-bottom:0"><button class="btn btn-sm" onclick="addExpert()">+ Add</button></div></div><div id="expert-list"></div><div id="expert-links" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #333"></div><div id="progress-area" style="margin-top:12px;display:none"></div><div style="margin-top:12px"><button class="btn" id="synthesize-btn" style="display:none" onclick="triggerSynth()">Synthesize Now</button></div></div>\';' +
+    'a.innerHTML=\'<div class="flex-between" style="margin-bottom:16px"><div><a href="/" style="color:#888;text-decoration:none;font-size:0.85rem">&larr; Back to Projects</a><h2 style="margin-top:4px">\'+escHtml(p.name)+\'</h2><div class="sub" style="margin-bottom:0">\'+escHtml(p.seed.slice(0,150))+\'</div></div><span class="tag">\'+escHtml(p.status)+\'</span></div>\'+\'<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><label style="margin-bottom:0;font-size:1rem">Questions (\'+p.questions.length+\')</label></div><div id="q-list">\'+qh+\'</div></div>\'+\'<div class="card"><label style="font-size:1rem">Add Experts</label><div style="margin-bottom:12px"><div class="expert-input-row"><input id="expert-name" placeholder="Name (e.g. Alice - Data Eng)" style="margin-bottom:0"><input id="expert-email" placeholder="Email (optional)" style="margin-bottom:0"><button class="btn btn-sm" onclick="addExpert()">+ Add</button></div></div><div id="expert-list"></div><div id="expert-links" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #333"></div><div id="progress-area" style="margin-top:12px;display:none"></div><div style="margin-top:12px">\'+(hasSynth?\'<button class="btn btn-sm" onclick="downloadBundle()">Download OKF Bundle (.zip)</button>\':\'<button class="btn" id="synthesize-btn" style="display:none" onclick="triggerSynth()">Synthesize Now</button>\')+\'</div></div>\';' +
     'refreshExperts()}' +
     'async function addExpert(){var n=document.getElementById("expert-name").value.trim();if(!n){showToast("Enter a name");return}' +
     'var e=document.getElementById("expert-email").value.trim();' +
@@ -316,9 +319,9 @@ async function projectDetailPage(req, env, pid) {
     'var bundleHtml="";if(sr.bundle){var bkeys=Object.keys(sr.bundle);' +
     'bundleHtml=\'<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">\';' +
     'bundleHtml+=\'<button class="btn btn-sm" onclick="downloadBundle()">Download OKF Bundle (.zip)</button>\';' +
-    'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'index.md\')">index.md</button>\';' +
-    'bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'log.md\')">log.md</button>\';' +
-    'bkeys.forEach(function(f){if(f!==\'index.md\'&&f!==\'log.md\'){bundleHtml+=\'<button class="btn btn-sm btn-secondary" onclick="downloadFile(\'\'+f+\'\')">\'+f+\'</button>\'}});' +
+    'bundleHtml+=\'<button class="btn btn-sm btn-secondary" data-file="index.md" onclick="downloadFile(this.dataset.file)">index.md</button>\';' +
+    'bundleHtml+=\'<button class="btn btn-sm btn-secondary" data-file="log.md" onclick="downloadFile(this.dataset.file)">log.md</button>\';' +
+    'bkeys.forEach(function(f){if(f!==\'index.md\'&&f!==\'log.md\'){bundleHtml+=\'<button class="btn btn-sm btn-secondary" data-file="\'+f+\'" onclick="downloadFile(this.dataset.file)">\'+f+\'</button>\'}});' +
     'bundleHtml+=\'</div>\';}' +
     'o.innerHTML=\'<div class="card"><h3>Output</h3><pre id="md-out">\'+escHtml(sr.markdown)+\'</pre><div style="margin-top:12px"><button class="btn btn-sm" onclick="copyMd()">Copy Markdown</button></div>\'+bundleHtml+\'</div>\';showToast("Synthesis complete!")}' +
     'function copyMd(){var p=document.getElementById("md-out");navigator.clipboard.writeText(p.textContent).then(function(){showToast("Copied!")})}' +
@@ -342,8 +345,7 @@ async function projectDetailPage(req, env, pid) {
 async function listUserProjects(req, env) {
   var uid = getUserId(req, env);
   if (!uid) return json({error: 'Unauthorized', projects: []}, 401);
-  var ut = getUserToken(req);
-  var projects = await sbQuery(env, 'chop_projects?user_id=eq.' + uid + '&select=*&order=created_at.desc', {userToken: ut});
+  var projects = await sbQuery(env, 'chop_projects?user_id=eq.' + uid + '&select=*&order=created_at.desc');
   if (!projects) projects = [];
   return json({projects: projects});
 }
@@ -382,8 +384,17 @@ async function answerPage(req, env, token) {
         '<div id="done-area" style="display:none;text-align:center;padding:40px 0">'+
           '<div style="font-size:3rem;margin-bottom:12px">\u2705</div>'+
           '<h2>All done! Thank you!</h2>'+
-          '<p style="color:#888;margin-top:8px">Your answers have been saved. You can close this page.</p>'+
+          '<p style="color:#888;margin-top:8px">Your answers have been saved.</p>'+
           '<div style="margin-top:16px;font-size:0.85rem;color:#666" id="done-stats"></div>'+
+        '</div>'+
+        '<div id="freeform-area" style="display:none;border-top:1px solid #333;padding-top:24px;margin-top:16px">'+
+          '<h3 style="margin-bottom:8px">Anything else to share? \u{1F5E3}\uFE0F</h3>'+
+          '<p style="color:#888;font-size:0.9rem;margin-bottom:12px">Got more thoughts, context, or stories about this topic? Ramble freely — it will get organized when the knowledge bundle is created.</p>'+
+          '<textarea id="freeform-input" placeholder="What else comes to mind about this topic?" style="min-height:120px"></textarea>'+
+          '<div style="display:flex;gap:8px;justify-content:space-between">'+
+            '<button class="btn" onclick="submitFreeform()">Send Free-form Thoughts</button>'+
+          '</div>'+
+          '<div id="freeform-saved" style="display:none;margin-top:12px;padding:12px;background:rgba(76,175,80,0.1);border-radius:8px;color:#81c784;font-size:0.9rem">\u2705 Your free-form thoughts have been saved! Share more below or close this page.</div>'+
         '</div>'+
       '</div>'+
     '</div>',
@@ -392,13 +403,17 @@ async function answerPage(req, env, token) {
     'async function loadQ(){var r=await fetch("/api/answer/"+T+"/questions");var d=await r.json();if(!r.ok){showToast("Error loading");return}A=d.assignments;I=d.current_index;renderQ()}'+
     'function renderQ(){var a=A.filter(function(x){return x.answered}).length;var s=A.filter(function(x){return x.skipped}).length;var t=A.length;'+
     'document.getElementById("a-count").textContent=a;document.getElementById("s-count").textContent=s;document.getElementById("t-count").textContent=t;'+
-    'if(I>=t){document.getElementById("question-area").style.display="none";document.getElementById("done-area").style.display="block";'+
+    'if(I>=t){document.getElementById("question-area").style.display="none";document.getElementById("done-area").style.display="block";document.getElementById("freeform-area").style.display="block";'+
     'document.getElementById("done-stats").textContent="You answered "+a+" of "+t+" questions"+(s>0?" (skipped "+s+").":".");return}'+
     'var q=A[I];document.getElementById("qid-badge").textContent=q.qid;document.getElementById("q-text").textContent=q.text;document.getElementById("answer-input").value="";document.getElementById("answer-input").focus()}'+
     'async function submitA(){var txt=document.getElementById("answer-input").value.trim();var r=await fetch("/api/answer/"+T+"/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({idx:I,text:txt})});'+
     'var d=await r.json();if(!r.ok){showToast("Error");return}A=d.assignments;I=d.current_index;renderQ()}'+
     'async function skipQ(){var r=await fetch("/api/answer/"+T+"/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({idx:I,skip:true})});'+
     'var d=await r.json();if(!r.ok){showToast("Error");return}A=d.assignments;I=d.current_index;renderQ()}'+
+    'async function submitFreeform(){var txt=document.getElementById("freeform-input").value.trim();if(!txt){showToast("Write something first");return}'+
+    'var r=await fetch("/api/answer/"+T+"/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({type:"freeform",text:txt})});'+
+    'if(!r.ok){showToast("Error saving");return}'+
+    'document.getElementById("freeform-input").value="";document.getElementById("freeform-saved").style.display="block"}'+
     'loadQ()'
   ), {headers:{'Content-Type':'text/html'}});
 }
@@ -443,47 +458,31 @@ async function getEvents(req, env) {
 async function createProject(req, env, ctx) {
   var body = await req.json();
   if (!body.seed || body.seed.length < 5) return json({error:'Seed too short'}, 400);
-  var name = body.seed.split('.')[0].slice(0,40).trim() || 'Untitled';
   var uid = getUserId(req, env);
-  var ut = getUserToken(req);
 
-  // Create the project instantly with status='generating', empty questions
-  var projBody = {name: name, seed: body.seed, questions: [], status: 'generating'};
-  if (uid) projBody.user_id = uid;
-  var result = await sbQuery(env, 'chop_projects', {
-    method: 'POST',
-    userToken: ut,
-    body: projBody
-  });
-  var project = result && result[0];
-  if (!project) return json({error:'Failed to create project'}, 500);
-
-  // Fire off the AI question generation via Edge Function
-  ctx.waitUntil((async function() {
-    try {
-      var efUrl = (env.SUPABASE_URL || _supabaseUrl).replace(/\/+$/, '') + '/functions/v1/generate-questions';
-      var efResp = await fetch(efUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-SUPABASE-URL': sbUrl(env),
-          'X-SUPABASE-SERVICE-KEY': sbKey(env),
-          'Authorization': 'Bearer ' + (ut || sbKey(env))
-        },
-        body: JSON.stringify({project_id: project.id})
-      });
-      if (!efResp.ok) {
-        var efErr = await efResp.text();
-        console.error('Background AI question gen failed for project', project.id, efResp.status, efErr);
-      } else {
-        console.log('Background AI question gen completed for project', project.id);
-      }
-    } catch(e) {
-      console.error('Background AI question gen error for project', project.id, e.message);
+  // Proxy the entire create+generate flow to the Edge Function (create mode)
+  // The EF creates the project, fires AI in background, returns immediately
+  var efUrl = (env.SUPABASE_URL || _supabaseUrl).replace(/\/+$/, '') + '/functions/v1/generate-questions';
+  try {
+    var efResp = await fetch(efUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + sbKey(env)
+      },
+      body: JSON.stringify({seed: body.seed, create: true, user_id: uid || null})
+    });
+    if (!efResp.ok) {
+      var efErr = await efResp.text();
+      console.error('AI question gen failed', efResp.status, efErr);
+      return json({error:'AI generation failed', detail: efErr}, 500);
     }
-  })());
-
-  return json(project);
+    var efResult = await efResp.json();
+    return json(efResult);
+  } catch(e) {
+    console.error('AI question gen error', e.message);
+    return json({error:'AI generation error'}, 500);
+  }
 }
 
 async function addExpert(req, env, pid) {
@@ -493,10 +492,8 @@ async function addExpert(req, env, pid) {
   var body = await req.json();
   if (!body.name) return json({error:'Name required'}, 400);
   var et = t(8);
-  var ut = getUserToken(req);
   var result = await sbQuery(env, 'chop_experts', {
     method: 'POST',
-    userToken: ut,
     body: {project_id: pid, name: body.name, email: body.email||'', token: et, status:'pending', answered:0, total_questions: (p.questions||[]).length}
   });
   var expert = result && result[0];
@@ -533,7 +530,21 @@ async function triggerSynthesis(req, env, pid) {
 
   // Fire the Edge Function asynchronously
   var ut = getUserToken(req);
-  await sbQuery(env, 'chop_projects?id=eq.' + pid, {method:'PATCH', body:{status:'synthesizing'}});
+  // Refresh PostgREST schema cache before PATCHing to prevent stale cache issues
+  try {
+    await fetch(sbUrl(env) + '/rest/v1/rpc/refresh_schema_cache', {
+      method: 'POST',
+      headers: {
+        'apikey': sbKey(env),
+        'Authorization': 'Bearer ' + sbKey(env),
+        'Content-Type': 'application/json'
+      },
+      body: '{}'
+    });
+  } catch(e) {
+    console.error('Schema cache refresh error (non-fatal):', e.message);
+  }
+  await sbQuery(env, 'chop_projects?id=eq.' + pid, {method:'PATCH', body:{status:'synthesizing'}, prefer:'return=representation,missing=default'});
 
   // Fire and forget via ctx.waitUntil would be ideal, but we need await for response
   // Since this is a POST endpoint, we can fire it and return immediately
@@ -597,6 +608,18 @@ async function submitAnswer(req, env, token) {
   var project = projects && projects[0];
   if (!project) return json({error:'Not found'}, 404);
   var questions = project.questions || [];
+  // Handle free-form / open-ended share
+  if (body.type === 'freeform') {
+    var txt = (body.text || '').trim();
+    if (!txt) return json({error:'Empty freeform text'}, 400);
+    var existingFree = await sbQuery(env, 'chop_answers?expert_id=eq.' + expert.id + '&question_id=eq.__freeform__&select=*');
+    if (existingFree && existingFree.length > 0) {
+      await sbQuery(env, 'chop_answers?id=eq.' + existingFree[0].id, {method:'PATCH', body:{answer: existingFree[0].answer + '\n\n---\n\n' + txt, answered_at: new Date().toISOString()}});
+    } else {
+      await sbQuery(env, 'chop_answers', {method:'POST', body:{project_id: expert.project_id, expert_id: expert.id, question_id: '__freeform__', question_text: 'Free-form thoughts', category: 'freeform', answer: txt}});
+    }
+    return json({saved:true});
+  }
   if (body.idx < 0 || body.idx >= questions.length) return json({error:'Invalid index'}, 400);
   var q = questions[body.idx];
   var ans = body.skip ? null : (body.text || '');
